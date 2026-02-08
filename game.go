@@ -19,24 +19,25 @@ import (
 )
 
 const (
-	RadarRadiusKM      = 1200.0
-	RadarCost          = 500.0
-	SatCost            = 2500.0
-	MaxSats            = 50
-	MaxRadars          = 500
-	CityImpactPenalty  = 5000.0
-	InterceptReward    = 200.0
-	EarthRadius        = 6371.0
-	EmergencyTarget    = 2 * time.Minute
-	RadarFile          = "RADAR.json"
-	BrainFile          = "BRAIN.gob"
-	ERAS_CYCLE_UPDATES = 100000
+	RadarRadiusKM     = 1200.0
+	RadarCost         = 500.0
+	SatCost           = 2500.0
+	MaxSats           = 50
+	MaxRadars         = 500
+	CityImpactPenalty = 5000.0
+	InterceptReward   = 200.0
+	EarthRadius       = 6371.0
+	EmergencyTarget   = 2 * time.Minute
+	RadarFile         = "RADAR.json"
+	BrainFile         = "BRAIN.gob"
+	PruneRefund       = 250.0
 )
 
 var (
 	entities        = make(map[string]*Entity)
 	kills           = make(map[string]int)
-	budget          = 150000.0 // Increased initial capital for global scale
+	threatHistory   = make([]Coordinate, 0)
+	budget          = 200000.0
 	mu              sync.RWMutex
 	lastImpact      time.Time
 	simClock        time.Time
@@ -46,8 +47,9 @@ var (
 	successRate     float64
 	totalThreats    int
 	totalIntercepts int
+	decisionCount   int
+	minRadarEver    = MaxRadars
 
-	// UPDATED CITY LIST: 67 GLOBAL TARGETS
 	cityData = map[string][]float64{
 		"Toronto": {43.65, -79.38}, "Montreal": {45.50, -73.56}, "Vancouver": {49.28, -123.12},
 		"Calgary": {51.04, -114.07}, "Edmonton": {53.54, -113.49}, "Ottawa": {45.42, -75.69},
@@ -85,7 +87,10 @@ type Entity struct {
 	Phase float64 `json:"phase"`
 }
 
-// --- BRAIN & PERSISTENCE ---
+type Coordinate struct {
+	Lat float64 `json:"lat"`
+	Lon float64 `json:"lon"`
+}
 
 type Brain struct {
 	g      *gorgonia.ExprGraph
@@ -144,13 +149,39 @@ func (b *Brain) LoadWeights() {
 	}
 }
 
-// --- PHYSICS & INTERCEPT ---
-
 func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 	p1, p2 := lat1*math.Pi/180, lat2*math.Pi/180
 	dp, dl := (lat2-lat1)*math.Pi/180, (lon2-lon1)*math.Pi/180
 	a := math.Sin(dp/2)*math.Sin(dp/2) + math.Cos(p1)*math.Cos(p2)*math.Sin(dl/2)*math.Sin(dl/2)
 	return EarthRadius * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+}
+
+func pruneRedundantRadars() {
+	mu.Lock()
+	defer mu.Unlock()
+	var toDelete []string
+	var radars []*Entity
+	for _, e := range entities {
+		if e.Type == "RADAR" {
+			radars = append(radars, e)
+		}
+	}
+	for i, r1 := range radars {
+		for j, r2 := range radars {
+			if i == j {
+				continue
+			}
+			if getDistanceKM(r1.Lat, r1.Lon, r2.Lat, r2.Lon) < 550.0 {
+				toDelete = append(toDelete, r1.ID)
+				break
+			}
+		}
+	}
+	for _, id := range toDelete {
+		delete(entities, id)
+		delete(kills, id)
+		budget += PruneRefund
+	}
 }
 
 func runPhysicsEngine() {
@@ -162,7 +193,6 @@ func runPhysicsEngine() {
 			continue
 		}
 
-		// Update Orbital Drift
 		t := float64(simClock.Unix()) / 3600.0
 		for _, e := range entities {
 			if e.Type == "SAT" {
@@ -170,13 +200,11 @@ func runPhysicsEngine() {
 			}
 		}
 
-		// Threat Logic
 		if rand.Float64() < 0.95 {
 			totalThreats++
 			target := entities[cityNames[rand.Intn(len(cityNames))]]
 			intercepted := false
 
-			// Check Radars
 			for id, e := range entities {
 				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
 					if rand.Float64() < 0.98 {
@@ -188,8 +216,6 @@ func runPhysicsEngine() {
 					}
 				}
 			}
-
-			// Check Satellites (Harmonic Bonus)
 			if !intercepted {
 				for _, e := range entities {
 					if e.Type == "SAT" {
@@ -211,6 +237,10 @@ func runPhysicsEngine() {
 			if !intercepted {
 				budget -= CityImpactPenalty
 				lastImpact = simClock
+				threatHistory = append(threatHistory, Coordinate{Lat: target.Lat, Lon: target.Lon})
+				if len(threatHistory) > 500 {
+					threatHistory = threatHistory[1:]
+				}
 			}
 		}
 
@@ -218,31 +248,29 @@ func runPhysicsEngine() {
 			successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 		}
 
-		// NN Prediction
 		input := []float64{math.Min(budget/300000.0, 1.0), globalCoverage / 100.0, successRate / 100.0}
 		action, conf := brain.Predict(input)
 		if conf < 0.45 || rand.Float64() < 0.10 {
 			action = rand.Intn(3)
 		}
 
-		radarCount, satCount := 0, 0
+		rCount, sCount := 0, 0
 		for _, e := range entities {
 			if e.Type == "RADAR" {
-				radarCount++
+				rCount++
 			} else if e.Type == "SAT" {
-				satCount++
+				sCount++
 			}
 		}
 
 		switch action {
 		case 1:
-			if radarCount < MaxRadars && budget >= RadarCost {
+			if rCount < MaxRadars && budget >= RadarCost {
 				id := fmt.Sprintf("R-%d", rand.Intn(1e6))
 				c := entities[cityNames[rand.Intn(len(cityNames))]]
 				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: c.Lat + rand.NormFloat64()*3, Lon: c.Lon + rand.NormFloat64()*3}
 				budget -= RadarCost
-			} else if radarCount >= MaxRadars {
-				// Recycle lowest performer
+			} else if rCount >= MaxRadars {
 				var worstID string
 				minK := math.MaxInt32
 				for id, e := range entities {
@@ -259,60 +287,61 @@ func runPhysicsEngine() {
 				}
 			}
 		case 2:
-			if satCount < MaxSats && budget >= SatCost {
+			if sCount < MaxSats && budget >= SatCost {
 				id := fmt.Sprintf("S-%d", rand.Intn(1e6))
 				lat := rand.Float64()*170 - 85
 				entities[id] = &Entity{ID: id, Type: "SAT", Lat: lat, Lon: rand.Float64()*360 - 180, BaseL: lat, Phase: rand.Float64() * 2 * math.Pi}
 				budget -= SatCost
 			}
 		}
-
+		decisionCount++
+		if decisionCount%100 == 0 {
+			pruneRedundantRadars()
+		}
 		simClock = simClock.Add(4 * time.Hour)
 		mu.Unlock()
 		time.Sleep(1 * time.Millisecond)
 	}
 }
 
-func calculateCoverage() {
-	satCount := 0
-	for _, e := range entities {
-		if e.Type == "SAT" {
-			satCount++
-		}
-	}
-	capArea := 2 * math.Pi * math.Pow(EarthRadius, 2) * (1 - math.Cos(0.35))
-	totalArea := 4 * math.Pi * math.Pow(EarthRadius, 2)
-	globalCoverage = math.Min((float64(satCount)*capArea)/totalArea, 1.0) * 100
-}
-
 func autonomousEraReset() {
 	mu.Lock()
 	defer mu.Unlock()
 	currentCycle++
-
-	// 10,000 ERA REFRESH
-	if currentCycle%ERAS_CYCLE_UPDATES == 0 {
+	rCount := 0
+	for id, e := range entities {
+		if e.Type == "RADAR" {
+			rCount++
+			if kills[id] < 1 {
+				delete(entities, id)
+				delete(kills, id)
+				rCount--
+			} else {
+				kills[id] = 0
+			}
+		}
+	}
+	if successRate > 95.0 && rCount < minRadarEver {
+		minRadarEver = rCount
+	}
+	if currentCycle%10000 == 0 {
 		for id, e := range entities {
 			if e.Type == "SAT" {
 				delete(entities, id)
-			} else if e.Type == "RADAR" && kills[id] < 15 { // Increased survivor threshold
-				delete(entities, id)
-				delete(kills, id)
 			}
 		}
 		budget += 500000
 	} else {
-		for id, e := range entities {
-			if e.Type == "RADAR" && kills[id] == 0 {
-				delete(entities, id)
-			}
-			if e.Type == "SAT" && rand.Float64() > 0.99 {
-				delete(entities, id)
-			}
-		}
-		budget += 75000
+		budget -= float64(rCount) * 15.0
+		budget += 80000
 	}
-	calculateCoverage()
+	sCount := 0
+	for _, e := range entities {
+		if e.Type == "SAT" {
+			sCount++
+		}
+	}
+	globalCoverage = math.Min((float64(sCount)*2*math.Pi*math.Pow(EarthRadius, 2)*(1-math.Cos(0.35)))/(4*math.Pi*math.Pow(EarthRadius, 2)), 1.0) * 100
 	totalThreats = 0
 	totalIntercepts = 0
 }
@@ -323,7 +352,6 @@ func main() {
 	}
 	setupSimulation()
 	go runPhysicsEngine()
-
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
@@ -333,14 +361,13 @@ func main() {
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"cycle": currentCycle, "budget": budget, "entities": all,
-			"coverage": globalCoverage, "success": successRate,
+			"coverage": globalCoverage, "success": successRate, "min_ever": minRadarEver, "threats": threatHistory,
 		})
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
 	go http.ListenAndServe(":8080", nil)
-
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
@@ -372,45 +399,43 @@ func setupSimulation() {
 	}
 	brain = NewBrain()
 	brain.LoadWeights()
-	calculateCoverage()
 	simClock, lastImpact = time.Now(), time.Now()
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS V11.3.0: GLOBAL</title>
+<!DOCTYPE html><html><head><title>AEGIS V11.3.4: HEATMAP</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://leaflet.github.io/Leaflet.heat/dist/leaflet-heat.js"></script>
 <style>
 	body { margin:0; background:#000; color:#0f0; font-family:monospace; }
 	#stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af; font-size:11px;}
 	#map { height:100vh; width:100vw; background: #000; }
 </style></head>
 <body>
-	<div id="stats">ERA: <span id="era">1</span> | RAD: <span id="rcount">0</span>/500 | SAT: <span id="scount">0</span>/50 | BUD: <span id="bud">0</span> | SUC: <span id="success">0</span>%</div>
+	<div id="stats">ERA: <span id="era">1</span> | RAD: <span id="rcount">0</span> | BEST MIN: <span id="minr">0</span> | SUC: <span id="success">0</span>%</div>
 	<div id="map"></div>
 <script>
 	var map = L.map('map', {zoomControl:false, attributionControl:false}).setView([20, 0], 2);
 	L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-	var layers = {};
+	var layers = {}, heatLayer = L.heatLayer([], {radius: 25, blur: 15, max: 1.0, gradient: {0.4: 'blue', 0.6: 'cyan', 0.7: 'lime', 0.8: 'yellow', 1.0: 'red'}}).addTo(map);
 	async function sync() {
 		try {
 			const r = await fetch('/intel'); const d = await r.json();
 			document.getElementById('era').innerText = d.cycle;
-			document.getElementById('bud').innerText = "$" + Math.floor(d.budget);
 			document.getElementById('success').innerText = d.success.toFixed(1);
-			let rCount = 0, sCount = 0;
+			document.getElementById('minr').innerText = d.min_ever;
+			heatLayer.setLatLngs(d.threats.map(t => [t.lat, t.lon]));
 			const currentIDs = d.entities.map(e => e.id);
 			Object.keys(layers).forEach(id => { if(!currentIDs.includes(id)) { map.removeLayer(layers[id]); delete layers[id]; } });
 			d.entities.forEach(e => {
-				if(e.type === 'RADAR') rCount++; else if(e.type === 'SAT') sCount++;
 				if (!layers[e.id]) {
-					if (e.type === 'RADAR') layers[e.id] = L.circle([e.lat, e.lon], {radius:1200000, color:'#0f0', weight:0.3, fillOpacity:0.01}).addTo(map);
+					if (e.type === 'RADAR') layers[e.id] = L.circle([e.lat, e.lon], {radius:1200000, color:'#0f0', weight:0.2, fillOpacity:0.01}).addTo(map);
 					else if (e.type === 'SAT') layers[e.id] = L.circleMarker([e.lat, e.lon], {radius:2, color:'#0af'}).addTo(map);
-					else if (e.type === 'CITY') layers[e.id] = L.circleMarker([e.lat, e.lon], {radius:4, color:'#ff0'}).addTo(map);
+					else if (e.type === 'CITY') layers[e.id] = L.circleMarker([e.lat, e.lon], {radius:3, color:'#f00'}).addTo(map);
 				} else { layers[e.id].setLatLng([e.lat, e.lon]); }
 			});
-			document.getElementById('rcount').innerText = rCount;
-			document.getElementById('scount').innerText = sCount;
+			document.getElementById('rcount').innerText = d.entities.filter(e => e.type === 'RADAR').length;
 		} catch(e) {}
 	}
 	setInterval(sync, 250);
