@@ -23,8 +23,9 @@ const (
 	RadarRadiusKM     = 1200.0
 	RadarCost         = 500.0
 	MaxRadars         = 500
+	MinRadars         = 100 // NEW: Lower limit for optimization records
 	CityImpactPenalty = 5000.0
-	InterceptReward   = 1500.0 // TRIPLED: Makes radars highly profitable to encourage building
+	InterceptReward   = 1500.0
 	EarthRadius       = 6371.0
 	EraDuration       = 24 * time.Hour
 	RadarFile         = "RADAR.json"
@@ -162,9 +163,10 @@ func autonomousEraReset() {
 		}
 	}
 
-	if successRate >= 95.0 && rCount <= minRadarEver {
+	// NEW: Best Minimum logic now enforces the 100-radar floor
+	if successRate >= 95.0 && rCount >= MinRadars && rCount <= minRadarEver {
 		minRadarEver = rCount
-		fmt.Printf("[ERA %d] RECORD: %d Radars @ %.1f%% Success. Saving...\n", currentCycle-1, rCount, successRate)
+		fmt.Printf("[ERA %d] RECORD: %d Radars @ %.1f%% Success. Checkpointing...\n", currentCycle-1, rCount, successRate)
 		saveSystemState()
 	}
 
@@ -232,24 +234,24 @@ func runPhysicsEngine() {
 			successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 		}
 
-		// STAGNATION BREAKER: Force exploration if NN is stuck at 1 radar
+		// AI Action Logic
 		input := []float64{
 			math.Max(-1, math.Min(budget/200000.0, 1.0)),
-			float64(rCount) / 10.0, // Scale sensitivity
+			float64(rCount) / 150.0, // Scaled for a larger expected grid
 			successRate / 100.0,
 		}
 		action := brain.Predict(input)
 
-		// Overriding the NN if success is low OR budget is massive OR random 2% chance
-		shouldBuild := action == 1 || (successRate < 80.0 && budget > 0) || (rand.Float64() < 0.02)
+		// ENFORCED GROWTH: Keep building until at least 100 radars exist
+		shouldBuild := action == 1 || (rCount < MinRadars && budget > 0) || (rand.Float64() < 0.02)
 
 		if shouldBuild && budget >= RadarCost && rCount < MaxRadars {
 			id := fmt.Sprintf("R-%d", rand.Intn(1e6))
 			c := entities[cityNames[rand.Intn(len(cityNames))]]
 			entities[id] = &Entity{
 				ID: id, Type: "RADAR",
-				Lat: c.Lat + (rand.Float64()-0.5)*10,
-				Lon: c.Lon + (rand.Float64()-0.5)*10,
+				Lat: c.Lat + (rand.Float64()-0.5)*12,
+				Lon: c.Lon + (rand.Float64()-0.5)*12,
 			}
 			budget -= RadarCost
 		}
@@ -312,7 +314,7 @@ func main() {
 	})
 
 	go http.ListenAndServe(":8080", nil)
-	fmt.Println("AEGIS V11.4.3: Reinforced Incentives Online.")
+	fmt.Printf("AEGIS V11.4.4 Active. Grid Floor set to %d.\n", MinRadars)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -340,7 +342,7 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS V11.4.3</title>
+<!DOCTYPE html><html><head><title>AEGIS V11.4.4</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -353,7 +355,7 @@ const uiHTML = `
     <div id="stats">
         ERA: <span id="era">0</span><br>
         RADARS: <span id="rcount">0</span><br>
-        BEST MIN: <span id="minr">0</span><br>
+        BEST MIN: <span id="minr">0</span> (Floor: 100)<br>
         SUCCESS: <span id="success">0</span>%<br>
         BUDGET: $<span id="budget">0</span>
         <button onclick="fetch('/skip')">MANUAL ERA SKIP</button>
