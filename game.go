@@ -22,11 +22,9 @@ import (
 const (
 	RadarRadiusKM     = 1200.0
 	RadarCost         = 500.0
-	SatCost           = 2500.0
-	MaxSats           = 50
 	MaxRadars         = 500
 	CityImpactPenalty = 5000.0
-	InterceptReward   = 200.0
+	InterceptReward   = 1500.0 // TRIPLED: Makes radars highly profitable to encourage building
 	EarthRadius       = 6371.0
 	EraDuration       = 24 * time.Hour
 	RadarFile         = "RADAR.json"
@@ -44,7 +42,6 @@ var (
 	simClock        time.Time
 	currentCycle    = 1
 	brain           *Brain
-	globalCoverage  float64
 	successRate     float64
 	totalThreats    int
 	totalIntercepts int
@@ -130,6 +127,52 @@ func (b *Brain) LoadWeights() {
 	}
 }
 
+// --- SYSTEM LOGICS ---
+
+func saveSystemState() {
+	brain.SaveWeights()
+	var opt []Entity
+	for _, e := range entities {
+		if e.Type == "CITY" || e.Type == "RADAR" {
+			opt = append(opt, *e)
+		}
+	}
+	d, _ := json.Marshal(opt)
+	os.WriteFile(RadarFile, d, 0644)
+}
+
+func autonomousEraReset() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	currentCycle++
+	eraStartTime = simClock
+
+	rCount := 0
+	for id, e := range entities {
+		if e.Type == "RADAR" {
+			rCount++
+			if kills[id] < 1 {
+				delete(entities, id)
+				delete(kills, id)
+				rCount--
+			} else {
+				kills[id] = 0
+			}
+		}
+	}
+
+	if successRate >= 95.0 && rCount <= minRadarEver {
+		minRadarEver = rCount
+		fmt.Printf("[ERA %d] RECORD: %d Radars @ %.1f%% Success. Saving...\n", currentCycle-1, rCount, successRate)
+		saveSystemState()
+	}
+
+	budget = 200000.0
+	totalThreats = 0
+	totalIntercepts = 0
+}
+
 func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 	p1, p2 := lat1*math.Pi/180, lat2*math.Pi/180
 	dp, dl := (lat2-lat1)*math.Pi/180, (lon2-lon1)*math.Pi/180
@@ -138,10 +181,8 @@ func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 }
 
 func runPhysicsEngine() {
-	ticker := time.NewTicker(10 * time.Microsecond)
-	for range ticker.C {
+	for {
 		mu.Lock()
-
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
@@ -149,21 +190,19 @@ func runPhysicsEngine() {
 			continue
 		}
 
-		// Calculate Sat Positions
-		t := float64(simClock.Unix()) / 3600.0
+		rCount := 0
 		for _, e := range entities {
-			if e.Type == "SAT" {
-				e.Lat = e.BaseL + (18.0 * math.Sin((2*math.Pi*t/24.0)+e.Phase))
+			if e.Type == "RADAR" {
+				rCount++
 			}
 		}
 
-		// Simulation Logic
-		if rand.Float64() < 0.98 {
+		// Threats
+		if rand.Float64() < 0.95 {
 			totalThreats++
 			target := entities[cityNames[rand.Intn(len(cityNames))]]
 			origin := Coordinate{Lat: rand.Float64()*180 - 90, Lon: rand.Float64()*360 - 180}
 			intercepted := false
-
 			for id, e := range entities {
 				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
 					kills[id]++
@@ -183,7 +222,7 @@ func runPhysicsEngine() {
 			if !intercepted {
 				budget -= CityImpactPenalty
 				threatHistory = append(threatHistory, Coordinate{Lat: target.Lat, Lon: target.Lon})
-				if len(threatHistory) > 100 {
+				if len(threatHistory) > 30 {
 					threatHistory = threatHistory[1:]
 				}
 			}
@@ -193,55 +232,36 @@ func runPhysicsEngine() {
 			successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 		}
 
-		// Decision Logic
-		input := []float64{math.Min(budget/300000.0, 1.0), globalCoverage / 100.0, successRate / 100.0}
+		// STAGNATION BREAKER: Force exploration if NN is stuck at 1 radar
+		input := []float64{
+			math.Max(-1, math.Min(budget/200000.0, 1.0)),
+			float64(rCount) / 10.0, // Scale sensitivity
+			successRate / 100.0,
+		}
 		action := brain.Predict(input)
 
-		if action == 1 && budget >= RadarCost {
+		// Overriding the NN if success is low OR budget is massive OR random 2% chance
+		shouldBuild := action == 1 || (successRate < 80.0 && budget > 0) || (rand.Float64() < 0.02)
+
+		if shouldBuild && budget >= RadarCost && rCount < MaxRadars {
 			id := fmt.Sprintf("R-%d", rand.Intn(1e6))
 			c := entities[cityNames[rand.Intn(len(cityNames))]]
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: c.Lat + rand.NormFloat64()*2, Lon: c.Lon + rand.NormFloat64()*2}
+			entities[id] = &Entity{
+				ID: id, Type: "RADAR",
+				Lat: c.Lat + (rand.Float64()-0.5)*10,
+				Lon: c.Lon + (rand.Float64()-0.5)*10,
+			}
 			budget -= RadarCost
 		}
 
 		simClock = simClock.Add(1 * time.Hour)
 		mu.Unlock()
-
-		// Allow the OS and Web Server to breathe
 		runtime.Gosched()
 	}
 }
 
-func autonomousEraReset() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentCycle++
-	eraStartTime = simClock
-
-	rCount := 0
-	for id, e := range entities {
-		if e.Type == "RADAR" {
-			rCount++
-			if kills[id] < 1 {
-				delete(entities, id)
-				delete(kills, id)
-				rCount--
-			} else {
-				kills[id] = 0
-			}
-		}
-	}
-	if successRate > 95.0 && rCount < minRadarEver {
-		minRadarEver = rCount
-	}
-	budget += 80000
-	totalThreats = 0
-	totalIntercepts = 0
-}
-
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	cityData := map[string][]float64{
 		"Toronto": {43.65, -79.38}, "Montreal": {45.50, -73.56}, "Vancouver": {49.28, -123.12},
 		"Calgary": {51.04, -114.07}, "Edmonton": {53.54, -113.49}, "Ottawa": {45.42, -75.69},
@@ -283,41 +303,24 @@ func main() {
 			all = append(all, *e)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cycle": currentCycle, "budget": budget, "entities": all,
-			"success": successRate, "min_ever": minRadarEver, "threats": threatHistory, "vectors": lastVectors,
+			"cycle": currentCycle, "budget": budget, "entities": all, "success": successRate, "min_ever": minRadarEver, "vectors": lastVectors,
 		})
 	})
-
-	http.HandleFunc("/skip", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		forceReset = true
-		mu.Unlock()
-	})
-
+	http.HandleFunc("/skip", func(w http.ResponseWriter, r *http.Request) { mu.Lock(); forceReset = true; mu.Unlock() })
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
 
 	go http.ListenAndServe(":8080", nil)
-	fmt.Println("AEGIS V11.3.8 Running. Use CTRL+C to save and exit.")
+	fmt.Println("AEGIS V11.4.3: Reinforced Incentives Online.")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
-
-	fmt.Println("\nShutdown initiated. Saving states...")
 	mu.Lock()
-	brain.SaveWeights()
-	var opt []Entity
-	for _, e := range entities {
-		if (e.Type == "RADAR" && kills[e.ID] >= 0) || e.Type == "CITY" {
-			opt = append(opt, *e)
-		}
-	}
-	d, _ := json.Marshal(opt)
-	os.WriteFile(RadarFile, d, 0644)
+	saveSystemState()
 	mu.Unlock()
-	fmt.Println("Safe exit completed.")
+	fmt.Println("Safe Exit.")
 }
 
 func setupSimulation() {
@@ -328,6 +331,7 @@ func setupSimulation() {
 		for _, e := range saved {
 			if e.Type != "CITY" {
 				entities[e.ID] = &e
+				kills[e.ID] = 1
 			}
 		}
 	}
@@ -336,18 +340,23 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS V11.3.8</title>
+<!DOCTYPE html><html><head><title>AEGIS V11.4.3</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
     body { margin:0; background:#000; color:#0f0; font-family:monospace; }
-    #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af; font-size:12px;}
+    #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af; font-size:12px; line-height:1.5;}
     #map { height:100vh; width:100vw; }
+    button { background:#0af; color:#000; border:none; padding:4px; cursor:pointer; font-weight:bold; width:100%; margin-top:5px;}
 </style></head>
 <body>
     <div id="stats">
-        ERA: <span id="era">1</span> | RAD: <span id="rcount">0</span> | BEST MIN: <span id="minr">0</span> | SUC: <span id="success">0</span>% 
-        <button onclick="fetch('/skip')">SKIP ERA</button>
+        ERA: <span id="era">0</span><br>
+        RADARS: <span id="rcount">0</span><br>
+        BEST MIN: <span id="minr">0</span><br>
+        SUCCESS: <span id="success">0</span>%<br>
+        BUDGET: $<span id="budget">0</span>
+        <button onclick="fetch('/skip')">MANUAL ERA SKIP</button>
     </div>
     <div id="map"></div>
 <script>
@@ -360,10 +369,11 @@ const uiHTML = `
             document.getElementById('era').innerText = d.cycle;
             document.getElementById('success').innerText = d.success.toFixed(1);
             document.getElementById('minr').innerText = d.min_ever;
+            document.getElementById('budget').innerText = d.budget.toLocaleString();
             
             vectorLayers.forEach(l => map.removeLayer(l)); vectorLayers = [];
             d.vectors.forEach(v => {
-                vectorLayers.push(L.polyline([[v.start.lat, v.start.lon], [v.end.lat, v.end.lon]], {color: 'red', weight: 1, opacity: 0.3}).addTo(map));
+                vectorLayers.push(L.polyline([[v.start.lat, v.start.lon], [v.end.lat, v.end.lon]], {color: 'red', weight: 1, opacity: 0.2}).addTo(map));
             });
 
             const currentIDs = d.entities.map(e => e.id);
