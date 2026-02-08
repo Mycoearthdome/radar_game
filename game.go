@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -12,61 +13,42 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"gorgonia.org/gorgonia"
+	"gorgonia.org/tensor"
 )
 
-// --- CONFIGURATION ---
 const (
-	RadarRadiusKM   = 1200.0
-	SatRadiusKM     = 1400.0
-	RadarFile       = "RADAR.json"
-	SatCost         = 400.0
-	InterceptGain   = 25.0
-	BasePeaceDiv    = 25.0
-	MaxSatellites   = 45
-	EmergencyTarget = 2 * time.Minute
-	EarthRadius     = 6371.0
+	RadarRadiusKM      = 1200.0
+	RadarCost          = 500.0
+	SatCost            = 2500.0
+	MaxSats            = 50
+	MaxRadars          = 500
+	CityImpactPenalty  = 5000.0
+	InterceptReward    = 200.0
+	EarthRadius        = 6371.0
+	EmergencyTarget    = 2 * time.Minute
+	RadarFile          = "RADAR.json"
+	BrainFile          = "BRAIN.gob"
+	ERAS_CYCLE_UPDATES = 100000
 )
 
 var (
-	BaseWarp        = 50.0
-	CurrentWarp     = 50.0
 	entities        = make(map[string]*Entity)
-	budget          = 3000.0
+	kills           = make(map[string]int)
+	budget          = 150000.0 // Increased initial capital for global scale
 	mu              sync.RWMutex
 	lastImpact      time.Time
 	simClock        time.Time
 	currentCycle    = 1
-	activeTarget    = EmergencyTarget
-	radarEfficiency = make(map[string]int)
-	cityNames       []string
-)
+	brain           *Brain
+	globalCoverage  float64
+	successRate     float64
+	totalThreats    int
+	totalIntercepts int
 
-type Entity struct {
-	ID       string  `json:"id"`
-	Type     string  `json:"type"`
-	Lat      float64 `json:"lat"`
-	Lon      float64 `json:"lon"`
-	TargetID string  `json:"target_id,omitempty"`
-	Phase    float64 `json:"phase"`
-}
-
-type Command struct {
-	Action string
-	ID     string
-	Data   *Entity
-}
-
-func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
-	dLat := (lat2 - lat1) * math.Pi / 180.0
-	dLon := (lon2 - lon1) * math.Pi / 180.0
-	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
-		math.Cos(lat1*math.Pi/180.0)*math.Cos(lat2*math.Pi/180.0)*
-			math.Sin(dLon/2)*math.Sin(dLon/2)
-	return EarthRadius * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
-}
-
-func setupSimulation() {
-	cities := map[string][]float64{
+	// UPDATED CITY LIST: 67 GLOBAL TARGETS
+	cityData = map[string][]float64{
 		"Toronto": {43.65, -79.38}, "Montreal": {45.50, -73.56}, "Vancouver": {49.28, -123.12},
 		"Calgary": {51.04, -114.07}, "Edmonton": {53.54, -113.49}, "Ottawa": {45.42, -75.69},
 		"Winnipeg": {49.89, -97.13}, "Quebec City": {46.81, -71.20}, "Halifax": {44.64, -63.57},
@@ -91,189 +73,254 @@ func setupSimulation() {
 		"Sydney": {-33.86, 151.20}, "Melbourne": {-37.81, 144.96}, "Auckland": {-36.84, 174.76},
 		"Perth": {-31.95, 115.86}, "Honolulu": {21.30, -157.85},
 	}
-	for name, pos := range cities {
-		entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
-		cityNames = append(cityNames, name)
-	}
-	if data, err := os.ReadFile(RadarFile); err == nil {
-		var saved []Entity
-		if err := json.Unmarshal(data, &saved); err == nil {
-			for i := range saved {
-				entities[saved[i].ID] = &saved[i]
-				radarEfficiency[saved[i].ID] = 1
-			}
-		}
-	}
-	simClock = time.Now()
-	lastImpact = simClock.Add(-5 * time.Second)
+	cityNames []string
+)
+
+type Entity struct {
+	ID    string  `json:"id"`
+	Type  string  `json:"type"`
+	Lat   float64 `json:"lat"`
+	Lon   float64 `json:"lon"`
+	BaseL float64 `json:"base_lat"`
+	Phase float64 `json:"phase"`
 }
 
-func autonomousEraReset() {
-	mu.Lock()
-	defer mu.Unlock()
+// --- BRAIN & PERSISTENCE ---
 
-	fmt.Printf("\n--- ERA %d ANALYSIS ---\n", currentCycle)
-	survivors := 0
-	totalRadars := 0
-
-	for id, e := range entities {
-		if e.Type == "RADAR" {
-			totalRadars++
-			if radarEfficiency[id] == 0 {
-				delete(entities, id)
-			} else {
-				radarEfficiency[id] = 0 // Persistent: score reset for new era test
-				survivors++
-			}
-		}
-		if e.Type == "MISSILE" || e.Type == "INTERCEPTOR" {
-			delete(entities, id)
-		}
-	}
-
-	currentCycle++
-	budget += 5000.0
-	lastImpact = simClock
-	fmt.Printf("Evolution: %d/%d Radars retained. New Era %d Starting.\n", survivors, totalRadars, currentCycle)
+type Brain struct {
+	g      *gorgonia.ExprGraph
+	w0, w1 *gorgonia.Node
 }
 
-func saveOptimalAndExit() {
-	mu.Lock()
-	defer mu.Unlock()
-	var optimal []Entity
-	for _, e := range entities {
-		if e.Type == "RADAR" {
-			optimal = append(optimal, *e)
+func NewBrain() *Brain {
+	g := gorgonia.NewGraph()
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(3, 12), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
+	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(12, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
+	return &Brain{g: g, w0: w0, w1: w1}
+}
+
+func (b *Brain) Predict(input []float64) (int, float64) {
+	g := gorgonia.NewGraph()
+	x := gorgonia.NewVector(g, tensor.Float64, gorgonia.WithShape(3), gorgonia.WithValue(tensor.New(tensor.WithBacking(input))))
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(3, 12), gorgonia.WithValue(b.w0.Value()))
+	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(12, 3), gorgonia.WithValue(b.w1.Value()))
+	l0 := gorgonia.Must(gorgonia.Rectify(gorgonia.Must(gorgonia.Mul(x, w0))))
+	out := gorgonia.Must(gorgonia.SoftMax(gorgonia.Must(gorgonia.Mul(l0, w1))))
+	vm := gorgonia.NewTapeMachine(g)
+	defer vm.Close()
+	vm.RunAll()
+	res := out.Value().Data().([]float64)
+	maxIdx := 0
+	for i, v := range res {
+		if v > res[maxIdx] {
+			maxIdx = i
 		}
 	}
-	data, _ := json.MarshalIndent(optimal, "", "  ")
-	os.WriteFile(RadarFile, data, 0644)
-	fmt.Printf("\nShutting down. Optimized Grid Saved: %d Radars.\n", len(optimal))
+	return maxIdx, res[maxIdx]
+}
+
+func (b *Brain) SaveWeights() {
+	f, _ := os.Create(BrainFile)
+	defer f.Close()
+	gob.NewEncoder(f).Encode(b.w0.Value())
+	gob.NewEncoder(f).Encode(b.w1.Value())
+}
+
+func (b *Brain) LoadWeights() {
+	f, err := os.Open(BrainFile)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	dec := gob.NewDecoder(f)
+	var w0T, w1T *tensor.Dense
+	dec.Decode(&w0T)
+	dec.Decode(&w1T)
+	if w0T != nil {
+		gorgonia.Let(b.w0, w0T)
+	}
+	if w1T != nil {
+		gorgonia.Let(b.w1, w1T)
+	}
+}
+
+// --- PHYSICS & INTERCEPT ---
+
+func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
+	p1, p2 := lat1*math.Pi/180, lat2*math.Pi/180
+	dp, dl := (lat2-lat1)*math.Pi/180, (lon2-lon1)*math.Pi/180
+	a := math.Sin(dp/2)*math.Sin(dp/2) + math.Cos(p1)*math.Cos(p2)*math.Sin(dl/2)*math.Sin(dl/2)
+	return EarthRadius * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
 
 func runPhysicsEngine() {
 	for {
-		commands := []Command{}
 		mu.Lock()
-
-		if simClock.Sub(lastImpact) >= (time.Duration(currentCycle) * activeTarget) {
+		if simClock.Sub(lastImpact) >= (time.Duration(currentCycle) * EmergencyTarget) {
 			mu.Unlock()
 			autonomousEraReset()
 			continue
 		}
 
-		threats, satCount := 0, 0
+		// Update Orbital Drift
+		t := float64(simClock.Unix()) / 3600.0
 		for _, e := range entities {
-			if e.Type == "MISSILE" {
-				threats++
+			if e.Type == "SAT" {
+				e.Lat = e.BaseL + (18.0 * math.Sin((2*math.Pi*t/24.0)+e.Phase))
 			}
-			if e.Type == "SATELLITE" {
+		}
+
+		// Threat Logic
+		if rand.Float64() < 0.95 {
+			totalThreats++
+			target := entities[cityNames[rand.Intn(len(cityNames))]]
+			intercepted := false
+
+			// Check Radars
+			for id, e := range entities {
+				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
+					if rand.Float64() < 0.98 {
+						kills[id]++
+						budget += InterceptReward
+						totalIntercepts++
+						intercepted = true
+						break
+					}
+				}
+			}
+
+			// Check Satellites (Harmonic Bonus)
+			if !intercepted {
+				for _, e := range entities {
+					if e.Type == "SAT" {
+						hBonus := 1.0
+						for _, n := range entities {
+							if n.Type == "SAT" && n.ID != e.ID && getDistanceKM(e.Lat, e.Lon, n.Lat, n.Lon) < 1800 {
+								hBonus += 0.25
+							}
+						}
+						if getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < (RadarRadiusKM * hBonus) {
+							budget += InterceptReward * 0.8 * hBonus
+							totalIntercepts++
+							intercepted = true
+							break
+						}
+					}
+				}
+			}
+			if !intercepted {
+				budget -= CityImpactPenalty
+				lastImpact = simClock
+			}
+		}
+
+		if totalThreats > 0 {
+			successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
+		}
+
+		// NN Prediction
+		input := []float64{math.Min(budget/300000.0, 1.0), globalCoverage / 100.0, successRate / 100.0}
+		action, conf := brain.Predict(input)
+		if conf < 0.45 || rand.Float64() < 0.10 {
+			action = rand.Intn(3)
+		}
+
+		radarCount, satCount := 0, 0
+		for _, e := range entities {
+			if e.Type == "RADAR" {
+				radarCount++
+			} else if e.Type == "SAT" {
 				satCount++
 			}
 		}
 
-		if threats < (currentCycle+3) && (rand.Float64() < 0.1 || threats == 0) {
-			mID := fmt.Sprintf("M-%d-%d", simClock.Unix(), rand.Intn(1000))
-			target := cityNames[rand.Intn(len(cityNames))]
-			entities[mID] = &Entity{ID: mID, Type: "MISSILE", Lat: rand.Float64()*150 - 75, Lon: rand.Float64()*360 - 180, TargetID: target}
-		}
-
-		CurrentWarp = BaseWarp
-		simClock = simClock.Add(time.Duration(CurrentWarp) * time.Second)
-		budget += (BasePeaceDiv * CurrentWarp / 3600.0)
-
-		for id, e := range entities {
-			switch e.Type {
-			case "SATELLITE":
-				e.Lon += 0.8 * (CurrentWarp / 10.0)
-				e.Lat = 72.0 * math.Sin((math.Pi/180.0)*e.Lon+e.Phase)
-				if e.Lon > 180 {
-					e.Lon -= 360
-				}
-			case "MISSILE":
-				target := entities[e.TargetID]
-				if getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < (35.0 * CurrentWarp) {
-					lastImpact = simClock
-					budget -= 1200.0
-
-					// Saturation Logic
-					isSaturated := false
-					for _, existing := range entities {
-						if existing.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, existing.Lat, existing.Lon) < (RadarRadiusKM*0.75) {
-							isSaturated = true
-							break
-						}
-					}
-
-					if !isSaturated {
-						rID := fmt.Sprintf("RADAR-%d", rand.Intn(1e9))
-						commands = append(commands, Command{"ADD", rID, &Entity{ID: rID, Type: "RADAR", Lat: e.Lat, Lon: e.Lon}})
-						radarEfficiency[rID] = 0
-					}
-					commands = append(commands, Command{"DEL", id, nil})
-				} else {
-					e.Lat += (target.Lat - e.Lat) * 0.04
-					e.Lon += (target.Lon - e.Lon) * 0.04
-					for sid, s := range entities {
-						if (s.Type == "RADAR" || s.Type == "SATELLITE") && getDistanceKM(e.Lat, e.Lon, s.Lat, s.Lon) < RadarRadiusKM {
-							if s.Type == "RADAR" {
-								radarEfficiency[sid]++
-							}
-							iID := "I-" + id
-							if _, t := entities[iID]; !t {
-								commands = append(commands, Command{"ADD", iID, &Entity{ID: iID, Type: "INTERCEPTOR", Lat: s.Lat, Lon: s.Lon, TargetID: id}})
-							}
-							break
-						}
+		switch action {
+		case 1:
+			if radarCount < MaxRadars && budget >= RadarCost {
+				id := fmt.Sprintf("R-%d", rand.Intn(1e6))
+				c := entities[cityNames[rand.Intn(len(cityNames))]]
+				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: c.Lat + rand.NormFloat64()*3, Lon: c.Lon + rand.NormFloat64()*3}
+				budget -= RadarCost
+			} else if radarCount >= MaxRadars {
+				// Recycle lowest performer
+				var worstID string
+				minK := math.MaxInt32
+				for id, e := range entities {
+					if e.Type == "RADAR" && kills[id] < minK {
+						minK = kills[id]
+						worstID = id
 					}
 				}
-			case "INTERCEPTOR":
-				target, ok := entities[e.TargetID]
-				if !ok {
-					commands = append(commands, Command{"DEL", id, nil})
-					continue
+				if worstID != "" {
+					c := entities[cityNames[rand.Intn(len(cityNames))]]
+					entities[worstID].Lat = c.Lat + rand.NormFloat64()*4
+					entities[worstID].Lon = c.Lon + rand.NormFloat64()*4
+					kills[worstID] = 0
 				}
-				if getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < (45.0 * CurrentWarp) {
-					budget += InterceptGain
-					commands = append(commands, Command{"DEL", e.TargetID, nil})
-					commands = append(commands, Command{"DEL", id, nil})
-				} else {
-					e.Lat += (target.Lat - e.Lat) * 0.35
-					e.Lon += (target.Lon - e.Lon) * 0.35
-				}
+			}
+		case 2:
+			if satCount < MaxSats && budget >= SatCost {
+				id := fmt.Sprintf("S-%d", rand.Intn(1e6))
+				lat := rand.Float64()*170 - 85
+				entities[id] = &Entity{ID: id, Type: "SAT", Lat: lat, Lon: rand.Float64()*360 - 180, BaseL: lat, Phase: rand.Float64() * 2 * math.Pi}
+				budget -= SatCost
 			}
 		}
 
-		for _, cmd := range commands {
-			if cmd.Action == "ADD" {
-				entities[cmd.ID] = cmd.Data
-			}
-			if cmd.Action == "DEL" {
-				delete(entities, cmd.ID)
-			}
-		}
-
-		if satCount < MaxSatellites && budget >= SatCost {
-			budget -= SatCost
-			sID := fmt.Sprintf("S-%d", rand.Intn(1e6))
-			site := launchSites[rand.Intn(len(launchSites))]
-			entities[sID] = &Entity{ID: sID, Type: "SATELLITE", Lat: site.Lat, Lon: site.Lon, Phase: float64(satCount) * 8.0}
-		}
+		simClock = simClock.Add(4 * time.Hour)
 		mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
-var launchSites = []LaunchSite{
-	{"KSC", 28.57, -80.64}, {"Baikonur", 45.96, 63.30}, {"Guiana", 5.23, -52.76},
+func calculateCoverage() {
+	satCount := 0
+	for _, e := range entities {
+		if e.Type == "SAT" {
+			satCount++
+		}
+	}
+	capArea := 2 * math.Pi * math.Pow(EarthRadius, 2) * (1 - math.Cos(0.35))
+	totalArea := 4 * math.Pi * math.Pow(EarthRadius, 2)
+	globalCoverage = math.Min((float64(satCount)*capArea)/totalArea, 1.0) * 100
 }
 
-type LaunchSite struct {
-	Name     string
-	Lat, Lon float64
+func autonomousEraReset() {
+	mu.Lock()
+	defer mu.Unlock()
+	currentCycle++
+
+	// 10,000 ERA REFRESH
+	if currentCycle%ERAS_CYCLE_UPDATES == 0 {
+		for id, e := range entities {
+			if e.Type == "SAT" {
+				delete(entities, id)
+			} else if e.Type == "RADAR" && kills[id] < 15 { // Increased survivor threshold
+				delete(entities, id)
+				delete(kills, id)
+			}
+		}
+		budget += 500000
+	} else {
+		for id, e := range entities {
+			if e.Type == "RADAR" && kills[id] == 0 {
+				delete(entities, id)
+			}
+			if e.Type == "SAT" && rand.Float64() > 0.99 {
+				delete(entities, id)
+			}
+		}
+		budget += 75000
+	}
+	calculateCoverage()
+	totalThreats = 0
+	totalIntercepts = 0
 }
 
 func main() {
+	for name := range cityData {
+		cityNames = append(cityNames, name)
+	}
 	setupSimulation()
 	go runPhysicsEngine()
 
@@ -285,79 +332,86 @@ func main() {
 			all = append(all, *e)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"peace": simClock.Sub(lastImpact).Seconds(), "budget": budget,
-			"cycle": currentCycle, "target": (time.Duration(currentCycle) * activeTarget).Seconds(),
-			"entities": all,
+			"cycle": currentCycle, "budget": budget, "entities": all,
+			"coverage": globalCoverage, "success": successRate,
 		})
 	})
-
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
-
 	go http.ListenAndServe(":8080", nil)
-	fmt.Println("AEGIS V9.5 ACTIVE: http://localhost:8080")
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	<-sig
-	saveOptimalAndExit()
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	brain.SaveWeights()
+	mu.Lock()
+	var opt []Entity
+	for _, e := range entities {
+		if (e.Type == "RADAR" && kills[e.ID] > 0) || e.Type == "SAT" || e.Type == "CITY" {
+			opt = append(opt, *e)
+		}
+	}
+	d, _ := json.Marshal(opt)
+	os.WriteFile(RadarFile, d, 0644)
+}
+
+func setupSimulation() {
+	for name, pos := range cityData {
+		entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
+	}
+	if data, err := os.ReadFile(RadarFile); err == nil {
+		var saved []Entity
+		json.Unmarshal(data, &saved)
+		for _, e := range saved {
+			if e.Type != "CITY" {
+				entities[e.ID] = &e
+				kills[e.ID] = 1
+			}
+		}
+	}
+	brain = NewBrain()
+	brain.LoadWeights()
+	calculateCoverage()
+	simClock, lastImpact = time.Now(), time.Now()
 }
 
 const uiHTML = `
-<!DOCTYPE html>
-<html>
-<head>
-    <title>AEGIS V9.5</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <style>
-        body { margin: 0; background: #000; color: #0f0; font-family: monospace; overflow: hidden; }
-        #stats { position: absolute; top: 0; width: 100%; display: flex; justify-content: space-around; background: rgba(0,10,0,0.9); padding: 12px; z-index: 1000; border-bottom: 1px solid #0f0; }
-        #map { height: 100vh; width: 100vw; background: #000; }
-        #progress-bar { height: 4px; width: 0%; background: #0ff; position: absolute; top: 50px; z-index: 1001; transition: width 0.1s linear; }
-    </style>
-</head>
+<!DOCTYPE html><html><head><title>AEGIS V11.3.0: GLOBAL</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+	body { margin:0; background:#000; color:#0f0; font-family:monospace; }
+	#stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af; font-size:11px;}
+	#map { height:100vh; width:100vw; background: #000; }
+</style></head>
 <body>
-    <div id="stats">
-        <div>ERA: <span id="cycle-num">1</span></div>
-        <div>PEACE_TICK: <span id="cur">0s</span></div>
-        <div>FUNDS: <span id="funds">$0</span></div>
-    </div>
-    <div id="progress-bar"></div>
-    <div id="map"></div>
-    <script>
-        var map = L.map('map', {zoomControl: false, attributionControl: false}).setView([20, 0], 2);
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-        var layers = {};
-        
-        async function sync() {
-            try {
-                const r = await fetch('/intel'); const d = await r.json();
-                document.getElementById('cur').innerText = Math.floor(d.peace) + "s";
-                document.getElementById('funds').innerText = "$" + Math.floor(d.budget);
-                document.getElementById('cycle-num').innerText = d.cycle;
-                document.getElementById('progress-bar').style.width = (d.peace / d.target) * 100 + "%";
-
-                d.entities.forEach(e => {
-                    if (!layers[e.id]) {
-                        if (e.type === 'SATELLITE') layers[e.id] = L.circleMarker([e.lat, e.lon], {color: '#0ff', radius: 3}).addTo(map);
-                        if (e.type === 'RADAR') layers[e.id] = L.circle([e.lat, e.lon], {color: '#0f0', radius: 1200000, fillOpacity: 0.1, weight: 1}).addTo(map);
-                        if (e.type === 'MISSILE') layers[e.id] = L.circleMarker([e.lat, e.lon], {color: '#f00', radius: 4}).addTo(map);
-                        if (e.type === 'INTERCEPTOR') layers[e.id] = L.circleMarker([e.lat, e.lon], {color: '#fff', radius: 2}).addTo(map);
-                        if (e.type === 'CITY') layers[e.id] = L.marker([e.lat, e.lon], {icon: L.divIcon({html: '<div style="background:#ff0;width:3px;height:3px;"></div>'})}).addTo(map);
-                    } else if (layers[e.id].setLatLng) {
-                        layers[e.id].setLatLng([e.lat, e.lon]);
-                    }
-                });
-
-                const currentIds = new Set(d.entities.map(e => e.id));
-                Object.keys(layers).forEach(id => {
-                    if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
-                });
-            } catch(e) {}
-        }
-        setInterval(sync, 100);
-    </script>
-</body>
-</html>`
+	<div id="stats">ERA: <span id="era">1</span> | RAD: <span id="rcount">0</span>/500 | SAT: <span id="scount">0</span>/50 | BUD: <span id="bud">0</span> | SUC: <span id="success">0</span>%</div>
+	<div id="map"></div>
+<script>
+	var map = L.map('map', {zoomControl:false, attributionControl:false}).setView([20, 0], 2);
+	L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
+	var layers = {};
+	async function sync() {
+		try {
+			const r = await fetch('/intel'); const d = await r.json();
+			document.getElementById('era').innerText = d.cycle;
+			document.getElementById('bud').innerText = "$" + Math.floor(d.budget);
+			document.getElementById('success').innerText = d.success.toFixed(1);
+			let rCount = 0, sCount = 0;
+			const currentIDs = d.entities.map(e => e.id);
+			Object.keys(layers).forEach(id => { if(!currentIDs.includes(id)) { map.removeLayer(layers[id]); delete layers[id]; } });
+			d.entities.forEach(e => {
+				if(e.type === 'RADAR') rCount++; else if(e.type === 'SAT') sCount++;
+				if (!layers[e.id]) {
+					if (e.type === 'RADAR') layers[e.id] = L.circle([e.lat, e.lon], {radius:1200000, color:'#0f0', weight:0.3, fillOpacity:0.01}).addTo(map);
+					else if (e.type === 'SAT') layers[e.id] = L.circleMarker([e.lat, e.lon], {radius:2, color:'#0af'}).addTo(map);
+					else if (e.type === 'CITY') layers[e.id] = L.circleMarker([e.lat, e.lon], {radius:4, color:'#ff0'}).addTo(map);
+				} else { layers[e.id].setLatLng([e.lat, e.lon]); }
+			});
+			document.getElementById('rcount').innerText = rCount;
+			document.getElementById('scount').innerText = sCount;
+		} catch(e) {}
+	}
+	setInterval(sync, 250);
+</script></body></html>`
