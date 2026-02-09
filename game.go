@@ -37,7 +37,7 @@ const (
 	Cols              = 36 // 360 / 10
 	Rows              = 18 // 180 / 10
 	TargetSuccess     = 100.0
-	RequiredWinStreak = 1000 // Number of eras to maintain 100% before "winning"
+	RequiredWinStreak = 1 // Number of eras to maintain 100% before "winning"
 )
 
 var (
@@ -715,7 +715,7 @@ const uiHTML = `
     #stats { 
         position:fixed; top:15px; left:15px; z-index:1000; 
         background:rgba(0,15,30,0.95); padding:20px; border:2px solid #0af; 
-        box-shadow: 0 0 20px #0af; border-radius: 4px; width: 260px;
+        box-shadow: 0 0 20px #0af; border-radius: 4px; width: 280px;
     } 
     #map { height:100vh; width:100vw; background: #000; }
     .stat-line { font-size: 1.1em; margin-bottom: 5px; border-bottom: 1px solid #0af3; }
@@ -728,7 +728,6 @@ const uiHTML = `
         transition: 0.3s;
     }
     #panic-btn:hover { background: #f00; color: #000; }
-    #win-progress { color: #f0f; font-weight: bold; }
 </style></head>
 <body>
 <div id="stats">
@@ -736,7 +735,7 @@ const uiHTML = `
     <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
     <div class="stat-line">FLEET: <span id="rcount" class="val">0</span> / <span id="maxr" class="highlight">0</span></div>
     <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
-    <div class="stat-line">WIN STREAK: <span id="streak" class="val highlight">0 / 10</span></div>
+    <div class="stat-line">WIN STREAK: <span id="streak" class="val highlight">0 / 1000</span></div>
     <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
     <button id="panic-btn" onclick="triggerPanic()">MANUAL SYSTEM RESET</button>
@@ -753,11 +752,13 @@ const uiHTML = `
     async function triggerPanic() {
         document.getElementById('status').innerText = "REBOOTING...";
         document.getElementById('status').style.color = "#f00";
-        await fetch('/panic'); //
-        setTimeout(() => {
-            document.getElementById('status').innerText = "ACTIVE";
-            document.getElementById('status').style.color = "#0f0";
-        }, 1000);
+        try {
+            await fetch('/panic');
+            setTimeout(() => {
+                document.getElementById('status').innerText = "ACTIVE";
+                document.getElementById('status').style.color = "#0f0";
+            }, 1000);
+        } catch (e) { console.error("Reset failed:", e); }
     }
 
     async function updateUI() {
@@ -768,51 +769,54 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // Handle Mission Over
+            // 1. Handle Final Win Condition
             if (data.isOver) {
-                document.getElementById('status').innerText = "SHIELD CONVERGED";
+                document.getElementById('status').innerText = "MISSION COMPLETE";
                 document.getElementById('status').style.color = "#f0f";
-                document.getElementById('streak').innerText = "COMPLETED";
+                document.getElementById('streak').innerText = "CONVERGED";
+                isFetching = false;
                 return; 
             }
 
-            // Watchdog: Auto-reset if the simulation engine stops iterating
-            if (data.yps <= 0) {
+            // 2. Watchdog: Auto-reset if YPS stalls at 0
+            if (data.yps <= 0 && data.cycle > 1) {
                 stallCount++;
-                if (stallCount > 40) { // Approx 6s of no movement
+                if (stallCount > 40) { 
+                    console.warn("Stall detected. Triggering recovery...");
                     triggerPanic();
                     stallCount = 0;
                 }
             } else { stallCount = 0; }
 
-            // Sync Stats
+            // 3. Sync Stats
             document.getElementById('era').innerText = data.cycle;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
-            document.getElementById('maxr').innerText = data.min_ever;
             document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
-            document.getElementById('streak').innerText = (data.streak || 0) + " / 1000";
-            
+            document.getElementById('streak').innerText = (data.streak || 0) + " / 1";
+
             const now = Date.now();
             const currentIds = new Set();
             let radarCount = 0;
 
+            // 4. Update Entities
             (data.entities || []).forEach(e => {
                 currentIds.add(e.id);
                 if (e.type === 'RADAR') radarCount++;
 
                 if (!layers[e.id]) {
-                    // Create marker
                     if (e.type === 'RADAR') {
-                        layers[e.id] = L.circle([e.lat, e.lon], { radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false }).addTo(map);
+                        layers[e.id] = L.circle([e.lat, e.lon], { 
+                            radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false 
+                        }).addTo(map);
                     } else {
-                        layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false }).addTo(map);
+                        layers[e.id] = L.circleMarker([e.lat, e.lon], { 
+                            radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false 
+                        }).addTo(map);
                     }
                 } else {
-                    // Update Position
                     layers[e.id].setLatLng([e.lat, e.lon]);
-                    
-                    // Visual feedback for AI relocations
+                    // Visual feedback for NN relocations
                     if (e.last_moved && (now - e.last_moved < 1500)) {
                         layers[e.id].setStyle({color: '#ff0', weight: 4, fillOpacity: 0.5});
                     } else if (e.type === 'RADAR') {
@@ -823,7 +827,7 @@ const uiHTML = `
 
             document.getElementById('rcount').innerText = radarCount;
 
-            // Remove dead entities
+            // 5. Cleanup Dead Entities
             for (let id in layers) {
                 if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
@@ -831,6 +835,5 @@ const uiHTML = `
         isFetching = false;
     }
     
-    // Refresh at high speed to capture real-time AI "nudges"
-    setInterval(updateUI, 150); 
+    setInterval(updateUI, 150);
 </script></body></html>`
