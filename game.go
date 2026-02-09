@@ -641,22 +641,25 @@ func main() {
 	go runPhysicsEngine()
 
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock() // Block physics engine from starting a new batch
+		mu.Lock() // Halt the physics engine's ability to start new batches
+		defer mu.Unlock()
 
-		// 1. Reset Brain and Capital
+		// 1. Reset Brain & Financials
 		brain = NewBrain(mutationRate)
 		budget = 500000.0
 
-		// 2. Clear and Re-populate Entities
+		// 2. Clear Maps Safely
 		entities = make(map[string]*Entity)
-		cityNames = []string{} // Reset the slice to prevent stale index lookups
+		cityNames = nil // Force workers to fail the len() check safely
+		kills = make(map[string]int)
 
+		// 3. Rebuild World State
 		for name, pos := range cityData {
 			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
 			cityNames = append(cityNames, name)
 		}
 
-		// 3. Re-seed initial radars so physics has targets
+		// 4. Re-seed Initial Radar Fleet
 		for i := 0; i < MinRadars; i++ {
 			id := fmt.Sprintf("R-START-%d", i)
 			lat, lon := getTetheredCoords()
@@ -664,8 +667,7 @@ func main() {
 		}
 
 		forceReset = true
-		mu.Unlock()
-		w.Write([]byte("Shield Re-initialized"))
+		w.Write([]byte("Shield Re-initialized Successfully"))
 	})
 
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
