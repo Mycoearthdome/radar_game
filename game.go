@@ -73,6 +73,20 @@ type Brain struct {
 	vm     gorgonia.VM
 }
 
+func (b *Brain) Mutate(rate float64) {
+	// Access the underlying tensors for weights
+	w0Data := b.w0.Value().Data().([]float64)
+	w1Data := b.w1.Value().Data().([]float64)
+
+	// Apply Gaussian noise: weight = weight + (randn * rate)
+	for i := range w0Data {
+		w0Data[i] += rand.NormFloat64() * rate
+	}
+	for i := range w1Data {
+		w1Data[i] += rand.NormFloat64() * rate
+	}
+}
+
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
 	// Input: [Budget/Limit, RadarCount/Max, SuccessRate, MissNW, MissNE, MissSW, MissSE]
@@ -251,9 +265,9 @@ func autonomousEraReset() {
 	}
 
 	// 3. BANKRUPTCY HANDLING
-	if budget < -BankruptcyLimit || totalEraSpending > BankruptcyLimit {
-		fmt.Println("\nBANKRUPTCY: Resetting Weights...")
-		brain = NewBrain(mutationRate)
+	if budget < -BankruptcyLimit {
+		fmt.Println("\nCRISIS: Applying Soft Gaussian Mutation...")
+		brain.Mutate(0.1) // 10% jitter to current knowledge
 		budget = 500000.0
 		goto FinalizeReset
 	}
@@ -286,12 +300,9 @@ func autonomousEraReset() {
 		radarArea := math.Pi * math.Pow(RadarRadiusKM, 2)
 		theoreticalCoverage := float64(len(radarIDs)-dropped) * radarArea
 		rCount = rCount - dropped
+		effectiveArea := theoreticalCoverage * (successRate / 100.0) // Adjusted for actual hits
 
-		// We display how much "coverage" each unit provides toward the 99% goal
-		fmt.Printf("BENCHMARK: %.2f Million KM2 covered by %d units.\n",
-			theoreticalCoverage/1000000.0, len(radarIDs)-dropped)
-		fmt.Printf("EFFICIENCY: %.2f KM2 per Radar unit.\n",
-			theoreticalCoverage/float64(len(radarIDs)-dropped))
+		fmt.Printf("PERFORMANCE: %.2f Million KM2 of ACTIVE protection.\n", effectiveArea/1e6)
 
 		fmt.Printf("[+] ERA %d: Success %.1f%% | Limit: %d | Dropped: %d\n", currentCycle, successRate, MaxRadars, dropped)
 		saveSystemState()
@@ -398,14 +409,20 @@ func runPhysicsEngine() {
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
 
+		// Calculate a dynamic multiplier based on failure
+		// Low success = big jumps (up to 20x); High success = tiny adjustments (min 1x)
+		precisionScale := 20.0 * (1.0 - (successRate / 100.0))
+		if precisionScale < 1.0 {
+			precisionScale = 1.0
+		}
+
 		switch action {
 		case 1: // BUILD NEW
 			// EMERGENCY OVERRIDE: Allow building if below MinRadars regardless of budget
 			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
 				baseLat, baseLon := getTetheredCoords()
-				// Use 15.0 multiplier for continental-scale moves
-				newLat := baseLat + (latNudge * 15.0)
-				newLon := baseLon + (lonNudge * 15.0)
+				newLat := baseLat + (latNudge * precisionScale * 2.0) // Aggressive search
+				newLon := baseLon + (lonNudge * precisionScale * 2.0)
 				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
 				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: newLat, Lon: newLon}
 				budget -= RadarCost
@@ -423,9 +440,9 @@ func runPhysicsEngine() {
 				}
 				if e, ok := entities[worstID]; ok {
 					baseLat, baseLon := getTetheredCoords()
-					// Relocation uses a tighter 5.0 nudge for precision honing
-					e.Lat = baseLat + (latNudge * 5.0)
-					e.Lon = baseLon + (lonNudge * 5.0)
+					// Relocation uses raw precision scale for surgical placement
+					e.Lat = baseLat + (latNudge * precisionScale)
+					e.Lon = baseLon + (lonNudge * precisionScale)
 					e.LastMoved = time.Now().UnixMilli()
 					kills[worstID] = 0
 					budget -= RelocationCost
