@@ -22,12 +22,12 @@ const (
 	RadarRadiusKM     = 1200.0
 	TetherRadiusKM    = 800.0
 	RadarCost         = 500.0
+	RelocationCost    = 50.0
 	EnforcementFee    = 1000.0
-	MaxRadars         = 500
 	MinRadars         = 60
-	CityImpactPenalty = 5000.0
-	InterceptReward   = 4500.0
-	EfficiencyBonus   = 10000.0
+	CityImpactPenalty = 4500.0
+	InterceptReward   = 6000.0
+	EfficiencyBonus   = 35000.0
 	EarthRadius       = 6371.0
 	EraDuration       = 24 * time.Hour
 	RadarFile         = "RADAR.json"
@@ -38,7 +38,7 @@ const (
 var (
 	entities         = make(map[string]*Entity)
 	kills            = make(map[string]int)
-	budget           = 500000.0
+	budget           = 2000000.0
 	totalEraSpending = 0.0
 	mu               sync.RWMutex
 	eraStartTime     time.Time
@@ -49,17 +49,19 @@ var (
 	successRate      float64
 	totalThreats     int
 	totalIntercepts  int
-	minRadarEver     = MaxRadars
+	MaxRadars        = 500
+	minEverRadars    = MaxRadars
 	forceReset       = false
 	cityNames        []string
 	mutationRate     = 1.0
 )
 
 type Entity struct {
-	ID   string  `json:"id" gob:"id"`
-	Type string  `json:"type" gob:"type"`
-	Lat  float64 `json:"lat" gob:"lat"`
-	Lon  float64 `json:"lon" gob:"lon"`
+	ID        string  `json:"id" gob:"id"`
+	Type      string  `json:"type" gob:"type"`
+	Lat       float64 `json:"lat" gob:"lat"`
+	Lon       float64 `json:"lon" gob:"lon"`
+	LastMoved int64   `json:"last_moved"`
 }
 
 type Brain struct {
@@ -72,13 +74,43 @@ type Brain struct {
 
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
+	// Input: [Budget/Limit, RadarCount/Max, SuccessRate]
 	x := gorgonia.NewVector(g, tensor.Float64, gorgonia.WithShape(3), gorgonia.WithName("x"))
-	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(3, 12), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(12, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+
+	// Hidden layer: 16 neurons for spatial complexity
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(3, 16), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+	// Output layer: 5 neurons
+	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(16, 5), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+
 	l0 := gorgonia.Must(gorgonia.Rectify(gorgonia.Must(gorgonia.Mul(x, w0))))
-	out := gorgonia.Must(gorgonia.SoftMax(gorgonia.Must(gorgonia.Mul(l0, w1))))
+	// Tanh ensures spatial nudges are between -1 and 1
+	out := gorgonia.Must(gorgonia.Tanh(gorgonia.Must(gorgonia.Mul(l0, w1))))
+
 	vm := gorgonia.NewTapeMachine(g)
 	return &Brain{g: g, w0: w0, w1: w1, x: x, out: out, vm: vm}
+}
+
+func (b *Brain) PredictSpatial(input []float64) (action int, latNudge, lonNudge float64) {
+	gorgonia.Let(b.x, tensor.New(tensor.WithBacking(input)))
+	b.vm.RunAll()
+	res := b.out.Value().Data().([]float64)
+	b.vm.Reset()
+
+	// 1. Determine Action (Argmax of the first 3 nodes)
+	action = 0
+	maxVal := res[0]
+	for i := 1; i < 3; i++ {
+		if res[i] > maxVal {
+			action = i
+			maxVal = res[i]
+		}
+	}
+
+	// 2. Extract Spatial Nudges (Nodes 3 and 4)
+	latNudge = res[3]
+	lonNudge = res[4]
+
+	return action, latNudge, lonNudge
 }
 
 func (b *Brain) Predict(input []float64) int {
@@ -95,29 +127,45 @@ func (b *Brain) Predict(input []float64) int {
 	return maxIdx
 }
 
-func (b *Brain) SaveWeights() {
-	f, _ := os.Create(BrainFile)
-	defer f.Close()
-	gob.NewEncoder(f).Encode(b.w0.Value())
-	gob.NewEncoder(f).Encode(b.w1.Value())
-}
+func loadSystemState() {
+	// 1. Load Radar Positions
+	if data, err := os.ReadFile(RadarFile); err == nil {
+		var savedEntities []Entity
+		if err := json.Unmarshal(data, &savedEntities); err == nil {
+			mu.Lock()
+			for _, e := range savedEntities {
+				if e.Type == "RADAR" {
+					entities[e.ID] = &Entity{
+						ID: e.ID, Type: e.Type,
+						Lat: e.Lat, Lon: e.Lon,
+						LastMoved: e.LastMoved,
+					}
+					kills[e.ID] = 0
+				}
+			}
+			mu.Unlock()
+		}
+	}
 
-func (b *Brain) LoadWeights() {
+	// 2. Load NN and Scaling Benchmarks
 	f, err := os.Open(BrainFile)
 	if err != nil {
 		return
 	}
 	defer f.Close()
+
 	dec := gob.NewDecoder(f)
 	var w0T, w1T *tensor.Dense
-	dec.Decode(&w0T)
-	dec.Decode(&w1T)
-	if w0T != nil {
-		gorgonia.Let(b.w0, w0T)
+
+	if err := dec.Decode(&w0T); err == nil {
+		gorgonia.Let(brain.w0, w0T)
 	}
-	if w1T != nil {
-		gorgonia.Let(b.w1, w1T)
+	if err := dec.Decode(&w1T); err == nil {
+		gorgonia.Let(brain.w1, w1T)
 	}
+
+	dec.Decode(&minEverRadars)
+	dec.Decode(&MaxRadars) // Recover the target scale
 }
 
 func getTetheredCoords() (float64, float64) {
@@ -131,15 +179,32 @@ func getTetheredCoords() (float64, float64) {
 }
 
 func saveSystemState() {
-	brain.SaveWeights()
-	var opt []Entity
+	mu.RLock()
+	defer mu.RUnlock()
+
+	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
+	f, err := os.Create(BrainFile)
+	if err == nil {
+		enc := gob.NewEncoder(f)
+		enc.Encode(brain.w0.Value())
+		enc.Encode(brain.w1.Value())
+		enc.Encode(minEverRadars)
+		enc.Encode(MaxRadars) // Persist the scaling limit
+		f.Close()
+	}
+
+	// 2. Save Optimized Radar Positions
+	var optimizedFleet []Entity
 	for _, e := range entities {
 		if e.Type == "CITY" || e.Type == "RADAR" {
-			opt = append(opt, *e)
+			optimizedFleet = append(optimizedFleet, *e)
 		}
 	}
-	d, _ := json.Marshal(opt)
-	os.WriteFile(RadarFile, d, 0644)
+
+	jsonData, err := json.MarshalIndent(optimizedFleet, "", "  ")
+	if err == nil {
+		os.WriteFile(RadarFile, jsonData, 0644)
+	}
 }
 
 func autonomousEraReset() {
@@ -154,47 +219,84 @@ func autonomousEraReset() {
 	}
 	rCount := len(radarIDs)
 
-	if successRate >= 99.0 && totalThreats >= 50 {
-		fmt.Printf("\n[!] TARGET REACHED: 99%% AT %d UNITS.\n", rCount)
-		saveSystemState()
-		os.Exit(0)
+	// 1. RECOVERY SEEDING
+	if rCount < MinRadars || budget < 0 {
+		fmt.Printf("\n[!] RECOVERING: Seeding fleet...\n")
+		for i := 0; i < MinRadars; i++ {
+			id := fmt.Sprintf("R-SEED-%d-%d", currentCycle, i)
+			lat, lon := getTetheredCoords()
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
+		}
+		radarIDs = nil
+		for id, e := range entities {
+			if e.Type == "RADAR" {
+				radarIDs = append(radarIDs, id)
+			}
+		}
+		rCount = len(radarIDs)
 	}
 
-	if totalEraSpending > BankruptcyLimit {
-		brain = NewBrain(mutationRate)
-		for _, id := range radarIDs {
-			delete(entities, id)
-			delete(kills, id)
+	// 2. TARGET SCALING (The New Logic)
+	// If we hit 99% success, we tighten the noose on the AI.
+	if successRate >= 99.0 && totalThreats >= 50 {
+		if rCount < minEverRadars {
+			minEverRadars = rCount
+
+			// TARGET SCALING: Lower the global limit to the new record.
+			// This prevents the AI from ever "buying back" into inefficiency.
+			MaxRadars = minEverRadars
+
+			fmt.Printf("\nTARGET SCALED: Max fleet size is now %d units.\n", MaxRadars)
+			saveSystemState()
 		}
+	}
+
+	// 3. BANKRUPTCY HANDLING
+	if budget < -BankruptcyLimit || totalEraSpending > BankruptcyLimit {
+		fmt.Println("\nBANKRUPTCY: Resetting Weights...")
+		brain = NewBrain(mutationRate)
+		budget = 500000.0
 		goto FinalizeReset
 	}
 
+	// 4. AGGRESSIVE PRUNING
 	if successRate >= 95.0 {
-		saveSystemState()
-		if rCount > minRadarEver {
-			sort.Slice(radarIDs, func(i, j int) bool {
-				return kills[radarIDs[i]] < kills[radarIDs[j]]
-			})
-			numToDrop := int(float64(rCount) * 0.10)
-			for i := 0; i < numToDrop; i++ {
-				if i >= len(radarIDs) || (len(entities)-len(cityNames)) <= MinRadars {
-					break
-				}
-				id := radarIDs[i]
-				delete(entities, id)
-				delete(kills, id)
-				budget += EfficiencyBonus
+		sort.Slice(radarIDs, func(i, j int) bool {
+			return kills[radarIDs[i]] < kills[radarIDs[j]]
+		})
+
+		// Drop 15% of the current fleet
+		numToDrop := int(float64(rCount) * 0.15)
+		dropped := 0
+		for i := 0; i < numToDrop; i++ {
+			if len(radarIDs)-dropped <= MinRadars {
+				break
 			}
-		} else {
-			minRadarEver = rCount
-			for _, id := range radarIDs {
-				if kills[id] == 0 {
-					delete(entities, id)
-					delete(kills, id)
-				}
-			}
+			id := radarIDs[i]
+			delete(entities, id)
+			delete(kills, id)
+			dropped++
+
+			// Efficiency Bonus rewards smaller fleet sizes
+			scalingFactor := 1.0 + (100.0 / float64(len(entities)-len(cityNames)+1))
+			budget += EfficiencyBonus * scalingFactor
 		}
+
+		// Benchmark Mode: Calculate KM2 Efficiency
+		// Area of circle = PI * r^2.
+		radarArea := math.Pi * math.Pow(RadarRadiusKM, 2)
+		theoreticalCoverage := float64(len(radarIDs)-dropped) * radarArea
+
+		// We display how much "coverage" each unit provides toward the 99% goal
+		fmt.Printf("BENCHMARK: %.2f Million KM2 covered by %d units.\n",
+			theoreticalCoverage/1000000.0, len(radarIDs)-dropped)
+		fmt.Printf("EFFICIENCY: %.2f KM2 per Radar unit.\n",
+			theoreticalCoverage/float64(len(radarIDs)-dropped))
+
+		fmt.Printf("[+] ERA %d: Success %.1f%% | Limit: %d | Dropped: %d\n", currentCycle, successRate, MaxRadars, dropped)
+		saveSystemState()
 	}
+
 	for id := range kills {
 		kills[id] = 0
 	}
@@ -202,7 +304,9 @@ func autonomousEraReset() {
 FinalizeReset:
 	currentCycle++
 	eraStartTime = simClock
-	budget = 500000.0
+	if budget < 500000.0 {
+		budget = 500000.0
+	}
 	totalEraSpending = 0
 	totalThreats = 0
 	totalIntercepts = 0
@@ -223,7 +327,6 @@ func runPhysicsEngine() {
 			eraStartTime = time.Now()
 		}
 
-		// Check for Era Reset or Force Reset
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
@@ -232,14 +335,12 @@ func runPhysicsEngine() {
 		}
 
 		// --- 1,000 THREAT BATCH ---
-		// This minimizes Mutex contention and maximizes i7 cache hits
 		const batchSize = 1000
 		for b := 0; b < batchSize; b++ {
 			totalThreats++
 			target := entities[cityNames[rand.Intn(len(cityNames))]]
 			intercepted := false
 
-			// Optimized distance checking
 			for id, e := range entities {
 				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
 					kills[id]++
@@ -252,11 +353,9 @@ func runPhysicsEngine() {
 			if !intercepted {
 				budget -= CityImpactPenalty
 			}
-
 			simClock = simClock.Add(4 * time.Hour)
 		}
 
-		// Re-calculate stats after the massive jump
 		successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 		rCount := 0
 		for _, e := range entities {
@@ -265,85 +364,191 @@ func runPhysicsEngine() {
 			}
 		}
 
-		// AI Placement Logic (once per 1k threats to keep logic/physics balanced)
-		if rCount < MinRadars {
-			for i := 0; i < (MinRadars - rCount); i++ {
-				id := fmt.Sprintf("R-REG-%d-%d", currentCycle, rand.Intn(1000000))
-				lat, lon := getTetheredCoords()
-				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
-				budget -= EnforcementFee
+		// --- AI SPATIAL LOGIC ---
+		input := []float64{
+			math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)),
+			float64(rCount) / float64(MaxRadars),
+			successRate / 100.0,
+		}
+
+		action, latNudge, lonNudge := brain.PredictSpatial(input)
+
+		switch action {
+		case 1: // BUILD NEW
+			// EMERGENCY OVERRIDE: If we are below MinRadars, ignore budget constraints.
+			// This breaks the "Doesn't want to invest" deadlock when bankrupt.
+			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
+				baseLat, baseLon := getTetheredCoords()
+				// Broaden the nudge: multiplying by 15.0 allows for continental-scale moves
+				newLat := baseLat + (latNudge * 15.0)
+				newLon := baseLon + (lonNudge * 15.0)
+				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: newLat, Lon: newLon}
+				budget -= RadarCost
+			}
+
+		case 2: // RELOCATE WORST PERFORMER
+			if budget >= RelocationCost && rCount > MinRadars {
+				var worstID string
+				minKills := 999999
+				for id, count := range kills {
+					if entities[id].Type == "RADAR" && count < minKills {
+						minKills = count
+						worstID = id
+					}
+				}
+				if e, ok := entities[worstID]; ok {
+					baseLat, baseLon := getTetheredCoords()
+					e.Lat = baseLat + (latNudge * 5.0)
+					e.Lon = baseLon + (lonNudge * 5.0)
+					e.LastMoved = time.Now().UnixMilli() // Mark move time
+					kills[worstID] = 0
+					budget -= RelocationCost
+				}
 			}
 		}
-
-		desperation := 0.0
-		if successRate < 90.0 {
-			desperation = (90.0 - successRate) / 100.0
-		}
-		input := []float64{math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)), float64(rCount) / 500.0, successRate / 100.0}
-
-		if (brain.Predict(input) == 1 || rand.Float64() < desperation) && budget >= RadarCost && rCount < MaxRadars {
-			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-			lat, lon := getTetheredCoords()
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
-			budget -= RadarCost
-		}
-
 		mu.Unlock()
-		// Let the CPU fly.
+		// This gives the CPU a 1ms breather to handle HTTP /intel requests
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	cityData := map[string][]float64{
+		// Canada
 		"Toronto": {43.65, -79.38}, "Montreal": {45.50, -73.56}, "Vancouver": {49.28, -123.12},
 		"Calgary": {51.04, -114.07}, "Edmonton": {53.54, -113.49}, "Ottawa": {45.42, -75.69},
 		"Winnipeg": {49.89, -97.13}, "Quebec City": {46.81, -71.20}, "Halifax": {44.64, -63.57},
 		"Victoria": {48.42, -123.36}, "Saskatoon": {52.13, -106.67}, "St. John's": {47.56, -52.71},
 		"Yellowknife": {62.45, -114.37}, "Whitehorse": {60.72, -135.05},
+
+		// USA
 		"New York": {40.71, -74.00}, "Los Angeles": {34.05, -118.24}, "Chicago": {41.87, -87.62},
-		"Houston": {29.76, -95.36}, "Washington DC": {38.89, -77.03}, "Miami": {25.76, -80.19},
-		"Mexico City": {19.43, -99.13}, "Havana": {23.11, -82.36}, "Anchorage": {61.21, -149.90},
-		"Sao Paulo": {-23.55, -46.63}, "Buenos Aires": {-34.60, -58.38}, "Lima": {-12.04, -77.04},
-		"Bogota": {4.71, -74.07}, "Rio de Janeiro": {-22.90, -43.17}, "Santiago": {-33.44, -70.66},
-		"Caracas": {10.48, -66.90}, "London": {51.50, -0.12}, "Paris": {48.85, 2.35},
-		"Berlin": {52.52, 13.40}, "Moscow": {55.75, 37.61}, "Rome": {41.90, 12.49},
-		"Madrid": {40.41, -3.70}, "Istanbul": {41.00, 28.97}, "Kyiv": {50.45, 30.52},
-		"Stockholm": {59.32, 18.06}, "Warsaw": {52.22, 21.01}, "Beijing": {39.90, 116.40},
-		"Tokyo": {35.68, 139.65}, "Seoul": {37.56, 126.97}, "Shanghai": {31.23, 121.47},
-		"Hong Kong": {22.31, 114.16}, "Singapore": {1.35, 103.81}, "Mumbai": {19.07, 72.87},
-		"New Delhi": {28.61, 77.20}, "Bangkok": {13.75, 100.50}, "Jakarta": {-6.20, 106.81},
-		"Manila": {14.59, 120.98}, "Taipei": {25.03, 121.56}, "Astana": {51.16, 71.47},
-		"Dubai": {25.20, 55.27}, "Riyadh": {24.71, 46.67}, "Tehran": {35.68, 51.38},
-		"Tel Aviv": {32.08, 34.78}, "Cairo": {30.04, 31.23}, "Lagos": {6.52, 3.37},
-		"Johannesburg": {-26.20, 28.04}, "Nairobi": {-1.29, 36.82}, "Casablanca": {33.57, -7.58},
-		"Sydney": {-33.86, 151.20}, "Melbourne": {-37.81, 144.96}, "Auckland": {-36.84, 174.76},
-		"Perth": {-31.95, 115.86}, "Honolulu": {21.30, -157.85},
+		"Houston": {29.76, -95.36}, "Phoenix": {33.45, -112.07}, "Philadelphia": {39.95, -75.16},
+		"San Francisco": {37.77, -122.42}, "Seattle": {47.61, -122.33},
+		"Washington DC": {38.89, -77.03}, "Miami": {25.76, -80.19},
+		"Boston": {42.36, -71.05}, "Atlanta": {33.75, -84.39},
+		"Denver": {39.74, -104.99}, "Las Vegas": {36.17, -115.14},
+		"San Diego": {32.72, -117.16}, "Dallas": {32.78, -96.80},
+		"Anchorage": {61.21, -149.90}, "Honolulu": {21.30, -157.85},
+
+		// Mexico & Central America
+		"Mexico City": {19.43, -99.13}, "Guadalajara": {20.67, -103.35},
+		"Monterrey": {25.68, -100.31}, "Panama City": {8.98, -79.52},
+		"San Jose": {9.93, -84.08},
+
+		// South America
+		"Sao Paulo": {-23.55, -46.63}, "Rio de Janeiro": {-22.90, -43.17},
+		"Buenos Aires": {-34.60, -58.38}, "Cordoba": {-31.42, -64.19},
+		"Lima": {-12.04, -77.04}, "Bogota": {4.71, -74.07},
+		"Santiago": {-33.44, -70.66}, "Caracas": {10.48, -66.90},
+		"Montevideo": {-34.90, -56.16}, "Asuncion": {-25.26, -57.58},
+		"Quito": {-0.18, -78.47}, "La Paz": {-16.50, -68.15},
+
+		// Europe
+		"London": {51.50, -0.12}, "Paris": {48.85, 2.35}, "Berlin": {52.52, 13.40},
+		"Rome": {41.90, 12.49}, "Madrid": {40.41, -3.70}, "Barcelona": {41.38, 2.17},
+		"Lisbon": {38.72, -9.14}, "Amsterdam": {52.37, 4.90},
+		"Brussels": {50.85, 4.35}, "Vienna": {48.21, 16.37},
+		"Prague": {50.08, 14.43}, "Budapest": {47.50, 19.04},
+		"Warsaw": {52.22, 21.01}, "Stockholm": {59.32, 18.06},
+		"Oslo": {59.91, 10.75}, "Copenhagen": {55.68, 12.57},
+		"Helsinki": {60.17, 24.94}, "Dublin": {53.35, -6.26},
+		"Zurich": {47.38, 8.54}, "Geneva": {46.20, 6.15},
+		"Athens": {37.98, 23.73}, "Istanbul": {41.00, 28.97},
+		"Kyiv": {50.45, 30.52}, "Moscow": {55.75, 37.61},
+
+		// Middle East
+		"Tel Aviv": {32.08, 34.78}, "Jerusalem": {31.77, 35.21},
+		"Dubai": {25.20, 55.27}, "Abu Dhabi": {24.45, 54.38},
+		"Riyadh": {24.71, 46.67}, "Jeddah": {21.49, 39.19},
+		"Doha": {25.29, 51.53}, "Kuwait City": {29.38, 47.98},
+		"Tehran": {35.68, 51.38}, "Baghdad": {33.31, 44.36},
+		"Amman": {31.95, 35.93},
+
+		// Africa
+		"Cairo": {30.04, 31.23}, "Alexandria": {31.20, 29.92},
+		"Lagos": {6.52, 3.37}, "Abuja": {9.07, 7.48},
+		"Johannesburg": {-26.20, 28.04}, "Cape Town": {-33.92, 18.42},
+		"Pretoria": {-25.75, 28.19}, "Nairobi": {-1.29, 36.82},
+		"Addis Ababa": {8.98, 38.79}, "Accra": {5.56, -0.20},
+		"Casablanca": {33.57, -7.58}, "Rabat": {34.02, -6.83},
+		"Tunis": {36.81, 10.18}, "Algiers": {36.75, 3.06},
+
+		// Asia
+		"Beijing": {39.90, 116.40}, "Shanghai": {31.23, 121.47},
+		"Shenzhen": {22.54, 114.06}, "Guangzhou": {23.13, 113.26},
+		"Hong Kong": {22.31, 114.16}, "Taipei": {25.03, 121.56},
+		"Tokyo": {35.68, 139.65}, "Osaka": {34.69, 135.50},
+		"Seoul": {37.56, 126.97}, "Busan": {35.18, 129.07},
+		"Bangkok": {13.75, 100.50}, "Hanoi": {21.03, 105.85},
+		"Ho Chi Minh City": {10.82, 106.63},
+		"Singapore":        {1.35, 103.81}, "Kuala Lumpur": {3.14, 101.69},
+		"Jakarta": {-6.20, 106.81}, "Manila": {14.59, 120.98},
+		"Mumbai": {19.07, 72.87}, "New Delhi": {28.61, 77.20},
+		"Bangalore": {12.97, 77.59}, "Chennai": {13.08, 80.27},
+		"Karachi": {24.86, 67.01}, "Lahore": {31.55, 74.34},
+		"Dhaka":  {23.81, 90.41},
+		"Astana": {51.16, 71.47}, "Almaty": {43.24, 76.88},
+
+		// Oceania
+		"Sydney": {-33.86, 151.20}, "Melbourne": {-37.81, 144.96},
+		"Brisbane": {-27.47, 153.03}, "Perth": {-31.95, 115.86},
+		"Auckland": {-36.84, 174.76}, "Wellington": {-41.29, 174.78},
 	}
+
 	for name, pos := range cityData {
 		entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
 		cityNames = append(cityNames, name)
 	}
 	setupSimulation()
+
+	// FORCED INITIALIZATION: Ensure the NN has assets to work with immediately.
+	mu.Lock()
+	radarCount := 0
+	for _, e := range entities {
+		if e.Type == "RADAR" {
+			radarCount++
+		}
+	}
+	if radarCount < MinRadars {
+		fmt.Println("INITIALIZING SEED FLEET...")
+		for i := 0; i < MinRadars; i++ {
+			id := fmt.Sprintf("R-START-%d", i)
+			lat, lon := getTetheredCoords()
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
+		}
+	}
+	mu.Unlock()
 	wallStart = time.Now()
+
 	go runPhysicsEngine()
 
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		brain = NewBrain(mutationRate)
+		budget = 500000.0                   // Restore starting capital
+		entities = make(map[string]*Entity) // Clear the failed 0-radar state
+		for name, pos := range cityData {
+			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
+		}
 		forceReset = true
 		mu.Unlock()
-		w.Write([]byte("Panic Reset Executed"))
+		w.Write([]byte("Shield Re-initialized"))
 	})
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
 
-		elapsedWall := time.Since(wallStart).Seconds()
-		totalSimDays := float64(totalThreats) * 4.0 / 24.0
-		yearsPerSec := 0.0
-		if elapsedWall > 0 {
-			yearsPerSec = (totalSimDays / 365.0) / elapsedWall
+		// Calculate Years Per Second
+		realSeconds := time.Since(wallStart).Seconds()
+		simHours := simClock.Sub(eraStartTime).Hours() + (float64(currentCycle-1) * EraDuration.Hours())
+		simYears := simHours / (24 * 365)
+
+		yps := 0.0
+		if realSeconds > 0 {
+			yps = simYears / realSeconds
 		}
 
 		var all []Entity
@@ -351,8 +556,12 @@ func main() {
 			all = append(all, *e)
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cycle": currentCycle, "budget": budget, "entities": all,
-			"success": successRate, "min_ever": minRadarEver, "yps": yearsPerSec,
+			"cycle":    currentCycle,
+			"budget":   budget,
+			"entities": all,
+			"success":  successRate,
+			"min_ever": minEverRadars, // Missing in your current version
+			"yps":      yps,           // You can calculate this as wall-time vs sim-time
 		})
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -363,59 +572,108 @@ func main() {
 }
 
 func setupSimulation() {
-	brain = NewBrain(mutationRate)
-	if data, err := os.ReadFile(RadarFile); err == nil {
-		var saved []Entity
-		json.Unmarshal(data, &saved)
-		for _, e := range saved {
-			if e.Type != "CITY" {
-				entities[e.ID] = &e
-				kills[e.ID] = 1
-			}
-		}
-	}
-	brain.LoadWeights()
+	brain = NewBrain(mutationRate) // Initialize graph first
+	loadSystemState()              // Overlay persistent data
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS i7 BENCHMARK</title>
+<!DOCTYPE html><html><head><title>AEGIS AI OPTIMIZER</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-    body { margin:0; background:#000; color:#0f0; font-family:monospace; } 
-    #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:15px; border:1px solid #0af; box-shadow: 0 0 10px #0af;} 
-    button { background:#f00; color:#fff; border:none; padding:8px; margin-top:10px; cursor:pointer; width:100%; font-weight:bold;} 
+    body { margin:0; background:#000; color:#0f0; font-family:monospace; overflow:hidden; } 
+    #stats { 
+        position:fixed; top:10px; left:10px; z-index:1000; 
+        background:rgba(0,10,20,0.9); padding:15px; border:1px solid #0af; 
+        box-shadow: 0 0 10px #0af; line-height:1.5;
+    } 
     #map { height:100vh; width:100vw; }
-    .benchmark { color: #ff0; font-weight: bold; }
+    .stat-val { color: #fff; font-weight: bold; }
+    .record-val { color: #f0f; font-weight: bold; }
 </style></head>
 <body>
 <div id="stats">
-    ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>
-    SUCCESS: <span id="success">0</span>% | BEST MIN: <span id="minr">0</span><br>
-    SPEED: <span id="yps" class="benchmark">0.00</span> <span class="benchmark">Years/Sec</span>
-    <button onclick="fetch('/panic')">SCORCHED EARTH (RESET BRAIN)</button>
+    ERA: <span id="era" class="stat-val">0</span> | 
+    RADARS: <span id="rcount" class="stat-val">0</span> / <span id="maxr" class="record-val">0</span><br>
+    SUCCESS: <span id="success" class="stat-val">0</span>% | 
+    BEST: <span id="min_ever" class="record-val">0</span><br>
+    BUDGET: $<span id="budget" class="stat-val">0</span> | 
+    SPEED: <span id="yps" class="stat-val">0</span> Yrs/Sec
 </div>
 <div id="map"></div>
 <script>
-    var map = L.map('map', {zoomControl:false}).setView([20, 0], 2);
+    // Initialize map with dark theme
+    var map = L.map('map', {zoomControl:false, attributionControl:false}).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
+    
     var layers = {};
+
     async function sync() {
-        const r = await fetch('/intel'); const d = await r.json();
-        document.getElementById('era').innerText = d.cycle;
-        document.getElementById('success').innerText = d.success.toFixed(1);
-        document.getElementById('minr').innerText = (d.min_ever == 500) ? "..." : d.min_ever;
-        document.getElementById('yps').innerText = d.yps.toFixed(2);
-        
-        const ids = d.entities.map(e => e.id);
-        Object.keys(layers).forEach(id => { if(!ids.includes(id)) { map.removeLayer(layers[id]); delete layers[id]; } });
-        d.entities.forEach(e => {
-            if (!layers[e.id]) {
-                if (e.type === 'RADAR') layers[e.id] = L.circle([e.lat, e.lon], {radius:1200000, color:'#0f0', weight:0.5, fillOpacity:0.1}).addTo(map);
-                else layers[e.id] = L.circleMarker([e.lat, e.lon], {radius:4, color:'#f00'}).addTo(map);
-            }
-        });
-        document.getElementById('rcount').innerText = d.entities.filter(e => e.type === 'RADAR').length;
+        try {
+            const r = await fetch('/intel'); 
+            if (!r.ok) throw new Error('Network response was not ok');
+            const d = await r.json();
+
+            // Update Text Stats
+            document.getElementById('era').innerText = d.cycle;
+            document.getElementById('success').innerText = d.success.toFixed(1);
+            document.getElementById('budget').innerText = d.budget.toLocaleString();
+            document.getElementById('min_ever').innerText = d.min_ever;
+            document.getElementById('yps').innerText = d.yps.toFixed(2);
+
+            const entities = d.entities || [];
+            const currentIds = entities.map(e => e.id);
+            const now = Date.now();
+
+            // Remove dead entities (pruned radars)
+            Object.keys(layers).forEach(id => {
+                if(!currentIds.includes(id)) {
+                    map.removeLayer(layers[id]);
+                    delete layers[id];
+                }
+            });
+            
+            let radarCount = 0;
+            entities.forEach(e => {
+                if (!layers[e.id]) {
+                    if (e.type === 'RADAR') {
+                        layers[e.id] = L.circle([e.lat, e.lon], {
+                            radius: 1200000, 
+                            color: '#0f0', 
+                            weight: 0.5, 
+                            fillOpacity: 0.1
+                        }).addTo(map);
+                    } else {
+                        layers[e.id] = L.circleMarker([e.lat, e.lon], {
+                            radius: 4, 
+                            color: '#f00',
+                            fillOpacity: 0.8
+                        }).addTo(map);
+                    }
+                } else {
+                    // Smooth position update
+                    layers[e.id].setLatLng([e.lat, e.lon]);
+                    
+                    // Relocation Flash Effect
+                    if (e.last_moved && (now - e.last_moved < 800)) {
+                        layers[e.id].setStyle({color: '#ff0', weight: 3, fillOpacity: 0.4});
+                        setTimeout(() => {
+                            if(layers[e.id]) layers[e.id].setStyle({color: '#0f0', weight: 0.5, fillOpacity: 0.1});
+                        }, 400);
+                    }
+                }
+                if (e.type === 'RADAR') radarCount++;
+            });
+
+            document.getElementById('rcount').innerText = radarCount;
+            // The limit scales down dynamically
+            document.getElementById('maxr').innerText = d.min_ever; 
+
+        } catch (err) {
+            console.error("UI Sync Error:", err);
+        }
     }
-    setInterval(sync, 500);
+
+    // High frequency sync for smooth "nudges" and relocation flashes
+    setInterval(sync, 1000);
 </script></body></html>`
