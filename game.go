@@ -54,6 +54,7 @@ var (
 	forceReset       = false
 	cityNames        []string
 	mutationRate     = 1.0
+	quadrantMisses   = make([]float64, 4) // [NW, NE, SW, SE]
 )
 
 type Entity struct {
@@ -74,16 +75,14 @@ type Brain struct {
 
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
-	// Input: [Budget/Limit, RadarCount/Max, SuccessRate]
-	x := gorgonia.NewVector(g, tensor.Float64, gorgonia.WithShape(3), gorgonia.WithName("x"))
+	// Input: [Budget/Limit, RadarCount/Max, SuccessRate, MissNW, MissNE, MissSW, MissSE]
+	x := gorgonia.NewVector(g, tensor.Float64, gorgonia.WithShape(7), gorgonia.WithName("x"))
 
-	// Hidden layer: 16 neurons for spatial complexity
-	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(3, 16), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-	// Output layer: 5 neurons
+	// Update Hidden layer input shape to 7
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(7, 16), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(16, 5), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 
 	l0 := gorgonia.Must(gorgonia.Rectify(gorgonia.Must(gorgonia.Mul(x, w0))))
-	// Tanh ensures spatial nudges are between -1 and 1
 	out := gorgonia.Must(gorgonia.Tanh(gorgonia.Must(gorgonia.Mul(l0, w1))))
 
 	vm := gorgonia.NewTapeMachine(g)
@@ -286,6 +285,7 @@ func autonomousEraReset() {
 		// Area of circle = PI * r^2.
 		radarArea := math.Pi * math.Pow(RadarRadiusKM, 2)
 		theoreticalCoverage := float64(len(radarIDs)-dropped) * radarArea
+		rCount = rCount - dropped
 
 		// We display how much "coverage" each unit provides toward the 99% goal
 		fmt.Printf("BENCHMARK: %.2f Million KM2 covered by %d units.\n",
@@ -310,6 +310,9 @@ FinalizeReset:
 	totalEraSpending = 0
 	totalThreats = 0
 	totalIntercepts = 0
+	for i := range quadrantMisses {
+		quadrantMisses[i] = 0
+	}
 }
 
 func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
@@ -327,6 +330,7 @@ func runPhysicsEngine() {
 			eraStartTime = time.Now()
 		}
 
+		// Handle Era Transitions
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
@@ -341,6 +345,7 @@ func runPhysicsEngine() {
 			target := entities[cityNames[rand.Intn(len(cityNames))]]
 			intercepted := false
 
+			// Check for interception
 			for id, e := range entities {
 				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
 					kills[id]++
@@ -350,13 +355,28 @@ func runPhysicsEngine() {
 					break
 				}
 			}
+
 			if !intercepted {
 				budget -= CityImpactPenalty
+				// SPATIAL MEMORY: Log which quadrant the miss occurred in
+				// Indexing: 0:NW, 1:NE, 2:SW, 3:SE
+				qIdx := 0
+				if target.Lat < 0 {
+					qIdx += 2
+				} // South
+				if target.Lon > 0 {
+					qIdx += 1
+				} // East
+				quadrantMisses[qIdx]++
 			}
 			simClock = simClock.Add(4 * time.Hour)
 		}
 
-		successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
+		// Calculate current performance metrics
+		if totalThreats > 0 {
+			successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
+		}
+
 		rCount := 0
 		for _, e := range entities {
 			if e.Type == "RADAR" {
@@ -364,22 +384,26 @@ func runPhysicsEngine() {
 			}
 		}
 
-		// --- AI SPATIAL LOGIC ---
+		// --- AI SPATIAL LOGIC (7-Input Vector) ---
+		// We pass Budget, Density, Success, and the 4 Quadrant Miss-counts
 		input := []float64{
 			math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)),
 			float64(rCount) / float64(MaxRadars),
 			successRate / 100.0,
+			math.Min(quadrantMisses[0]/100, 1.0), // Normalized NW Misses
+			math.Min(quadrantMisses[1]/100, 1.0), // Normalized NE Misses
+			math.Min(quadrantMisses[2]/100, 1.0), // Normalized SW Misses
+			math.Min(quadrantMisses[3]/100, 1.0), // Normalized SE Misses
 		}
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
 
 		switch action {
 		case 1: // BUILD NEW
-			// EMERGENCY OVERRIDE: If we are below MinRadars, ignore budget constraints.
-			// This breaks the "Doesn't want to invest" deadlock when bankrupt.
+			// EMERGENCY OVERRIDE: Allow building if below MinRadars regardless of budget
 			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
 				baseLat, baseLon := getTetheredCoords()
-				// Broaden the nudge: multiplying by 15.0 allows for continental-scale moves
+				// Use 15.0 multiplier for continental-scale moves
 				newLat := baseLat + (latNudge * 15.0)
 				newLon := baseLon + (lonNudge * 15.0)
 				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
@@ -388,7 +412,7 @@ func runPhysicsEngine() {
 			}
 
 		case 2: // RELOCATE WORST PERFORMER
-			if budget >= RelocationCost && rCount > MinRadars {
+			if budget >= RelocationCost && rCount > 0 {
 				var worstID string
 				minKills := 999999
 				for id, count := range kills {
@@ -399,16 +423,18 @@ func runPhysicsEngine() {
 				}
 				if e, ok := entities[worstID]; ok {
 					baseLat, baseLon := getTetheredCoords()
+					// Relocation uses a tighter 5.0 nudge for precision honing
 					e.Lat = baseLat + (latNudge * 5.0)
 					e.Lon = baseLon + (lonNudge * 5.0)
-					e.LastMoved = time.Now().UnixMilli() // Mark move time
+					e.LastMoved = time.Now().UnixMilli()
 					kills[worstID] = 0
 					budget -= RelocationCost
 				}
 			}
 		}
 		mu.Unlock()
-		// This gives the CPU a 1ms breather to handle HTTP /intel requests
+
+		// Breather for the HTTP scheduler to prevent UI update starvation
 		time.Sleep(1 * time.Millisecond)
 	}
 }
