@@ -87,6 +87,13 @@ func (b *Brain) Mutate(rate float64) {
 	}
 }
 
+func (b *Brain) AdaptiveMutate(success float64) {
+	// High success (99%) = tiny jitter (0.01)
+	// Low success (50%) = large jitter (0.2)
+	rate := 0.2 * (1.0 - (success / 100.0))
+	b.Mutate(rate)
+}
+
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
 	// Input: [Budget/Limit, RadarCount/Max, SuccessRate, MissNW, MissNE, MissSW, MissSE]
@@ -339,56 +346,81 @@ func runPhysicsEngine() {
 			simClock = time.Now()
 			eraStartTime = time.Now()
 		}
-
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
 			autonomousEraReset()
 			continue
 		}
-		mu.Unlock() // Release to let UI /intel handler work during math
+		mu.Unlock()
 
-		// 2. THREAT BATCH (1,000 cycles)
-		for b := 0; b < 1000; b++ {
-			mu.RLock()
-			target := entities[cityNames[rand.Intn(len(cityNames))]]
-			mu.RUnlock()
+		// 2. MULTI-THREADED THREAT BATCH (Parallelized)
+		var wg sync.WaitGroup
+		numWorkers := runtime.NumCPU()
+		batchSize := 1000
 
-			intercepted := false
-			// Check distance without holding a long-term lock
-			for id, e := range entities {
-				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
-					mu.Lock()
-					kills[id]++
-					totalIntercepts++
-					budget += InterceptReward
-					mu.Unlock()
-					intercepted = true
-					break
+		// Optimization: Use local accumulation to minimize lock contention
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				localKills := make(map[string]int)
+				localMisses := make([]float64, 4)
+				localIntercepts, localThreats, localReward, localPenalty := 0, 0, 0.0, 0.0
+
+				iterations := batchSize / numWorkers
+				for i := 0; i < iterations; i++ {
+					mu.RLock()
+					target := entities[cityNames[rand.Intn(len(cityNames))]]
+					mu.RUnlock()
+
+					intercepted := false
+					// RLock for distance check to keep UI fluid
+					mu.RLock()
+					for id, e := range entities {
+						if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
+							localKills[id]++
+							localIntercepts++
+							localReward += InterceptReward
+							intercepted = true
+							break
+						}
+					}
+					mu.RUnlock()
+
+					if !intercepted {
+						localThreats++
+						localPenalty += CityImpactPenalty
+						qIdx := 0
+						if target.Lat < 0 {
+							qIdx += 2
+						}
+						if target.Lon > 0 {
+							qIdx += 1
+						}
+						localMisses[qIdx]++
+					}
 				}
-			}
 
-			if !intercepted {
+				// Merge local results to global state once
 				mu.Lock()
-				budget -= CityImpactPenalty
-				totalThreats++
-				// Update Spatial Memory Quadrants
-				qIdx := 0
-				if target.Lat < 0 {
-					qIdx += 2
+				for id, count := range localKills {
+					kills[id] += count
 				}
-				if target.Lon > 0 {
-					qIdx += 1
+				for i, val := range localMisses {
+					quadrantMisses[i] += val
 				}
-				quadrantMisses[qIdx]++
+				totalIntercepts += localIntercepts
+				totalThreats += localThreats
+				budget += (localReward - localPenalty)
 				mu.Unlock()
-			}
+			}(w)
 		}
+		wg.Wait()
 
-		// 3. AI DECISION PHASE
+		// 3. AI DECISION PHASE (Inside Global Lock)
 		mu.Lock()
 		simClock = simClock.Add(4 * time.Hour)
-
 		if totalThreats > 0 {
 			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
@@ -400,7 +432,6 @@ func runPhysicsEngine() {
 			}
 		}
 
-		// 7-Input Vector for Spatial Learning
 		input := []float64{
 			math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)),
 			float64(rCount) / float64(MaxRadars),
@@ -412,36 +443,33 @@ func runPhysicsEngine() {
 		}
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
-
-		// Adaptive Precision: Moves become smaller as success increases
 		precisionScale := 20.0 * (1.0 - (successRate / 100.0))
 		if precisionScale < 1.0 {
 			precisionScale = 1.0
 		}
 
 		switch action {
-		case 1: // BUILD NEW
+		case 1: // BUILD
 			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
 				baseLat, baseLon := getTetheredCoords()
-				newLat := baseLat + (latNudge * precisionScale * 2.0)
-				newLon := baseLon + (lonNudge * precisionScale * 2.0)
-				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: newLat, Lon: newLon}
+				entities[fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))] = &Entity{
+					Type: "RADAR", Lat: baseLat + (latNudge * precisionScale * 2.0), Lon: baseLon + (lonNudge * precisionScale * 2.0),
+				}
 				budget -= RadarCost
 			}
-		case 2: // RELOCATE WORST
+		case 2: // RELOCATE
 			var worstID string
-			minKills := 999999
-			for id, count := range kills {
-				if entities[id].Type == "RADAR" && count < minKills {
-					minKills = count
+			minK := 999999
+			for id, c := range kills {
+				if entities[id].Type == "RADAR" && c < minK {
+					minK = c
 					worstID = id
 				}
 			}
 			if e, ok := entities[worstID]; ok && budget >= RelocationCost {
-				baseLat, baseLon := getTetheredCoords()
-				e.Lat = baseLat + (latNudge * precisionScale)
-				e.Lon = baseLon + (lonNudge * precisionScale)
+				bLat, bLon := getTetheredCoords()
+				e.Lat = bLat + (latNudge * precisionScale)
+				e.Lon = bLon + (lonNudge * precisionScale)
 				e.LastMoved = time.Now().UnixMilli()
 				kills[worstID] = 0
 				budget -= RelocationCost
@@ -449,8 +477,8 @@ func runPhysicsEngine() {
 		}
 		mu.Unlock()
 
-		// 4. BREATHER: Vital for UI responsiveness
-		time.Sleep(5 * time.Millisecond)
+		// 4. BREATHER: Essential for the HTTP server to serve the UI
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
