@@ -646,112 +646,103 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS AI OPTIMIZER v3 - CANVAS</title>
+<!DOCTYPE html><html><head><title>AEGIS REAL-TIME MONITOR</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-    body { margin:0; background:#000; color:#0f0; font-family:monospace; overflow:hidden; } 
+    body { margin:0; background:#001; color:#0f0; font-family:'Courier New', monospace; overflow:hidden; } 
     #stats { 
-        position:fixed; top:10px; left:10px; z-index:1000; 
-        background:rgba(0,10,20,0.9); padding:15px; border:1px solid #0af; 
-        box-shadow: 0 0 10px #0af; line-height:1.6; min-width: 220px;
+        position:fixed; top:15px; left:15px; z-index:1000; 
+        background:rgba(0,15,30,0.95); padding:20px; border:2px solid #0af; 
+        box-shadow: 0 0 20px #0af; border-radius: 4px;
     } 
     #map { height:100vh; width:100vw; background: #000; }
-    .stat-row { display: flex; justify-content: space-between; border-bottom: 1px solid #0af3; }
-    .stat-val { color: #fff; font-weight: bold; }
-    .record-val { color: #f0f; font-weight: bold; }
-    .legend { font-size: 0.8em; margin-top: 10px; color: #aaa; }
+    .stat-line { font-size: 1.1em; margin-bottom: 5px; border-bottom: 1px solid #0af3; }
+    .val { float: right; color: #fff; padding-left: 20px; }
+    .highlight { color: #f0f; }
 </style></head>
 <body>
 <div id="stats">
-    <div class="stat-row"><span>ERA:</span> <span id="era" class="stat-val">0</span></div>
-    <div class="stat-row"><span>RADARS:</span> <span><span id="rcount" class="stat-val">0</span> / <span id="maxr" class="record-val">0</span></span></div>
-    <div class="stat-row"><span>SUCCESS:</span> <span id="success" class="stat-val">0</span>%</div>
-    <div class="stat-row"><span>BEST:</span> <span id="min_ever" class="record-val">0</span></div>
-    <div class="stat-row"><span>BUDGET:</span> $<span id="budget" class="stat-val">0</span></div>
-    <div class="stat-row"><span>SPEED:</span> <span id="yps" class="stat-val">0</span> Y/sec</div>
-    <div class="legend">
-        <span style="color:#0f0">●</span> Coverage <span style="color:#f00">●</span> Target <span style="color:#ff0">●</span> Nudge
-    </div>
+    <div class="stat-line">SYSTEM STATUS: <span class="val" style="color:#0f0">ACTIVE</span></div>
+    <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
+    <div class="stat-line">FLEET: <span id="rcount" class="val">0</span> / <span id="maxr" class="highlight">0</span></div>
+    <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
+    <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
+    <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
 </div>
 <div id="map"></div>
 <script>
-    // CRITICAL: preferCanvas: true offloads rendering to the GPU
+    // Enable Canvas rendering to handle high-frequency updates without DOM lag
     var map = L.map('map', {
         zoomControl:false, 
         attributionControl:false,
         preferCanvas: true 
-    }).setView([20, 0], 2);
+    }).setView([25, 10], 2);
 
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
     
     var layers = {};
-    var isSyncing = false;
+    var isFetching = false;
 
-    async function sync() {
-        if (isSyncing) return;
-        isSyncing = true;
+    async function updateUI() {
+        if (isFetching) return;
+        isFetching = true;
 
         try {
-            const r = await fetch('/intel'); 
-            if (!r.ok) throw new Error('Network Busy');
-            const d = await r.json();
+            const response = await fetch('/intel');
+            const data = await response.json();
 
-            document.getElementById('era').innerText = d.cycle;
-            document.getElementById('success').innerText = (d.success || 0).toFixed(1);
-            document.getElementById('budget').innerText = Math.floor(d.budget).toLocaleString();
-            document.getElementById('min_ever').innerText = d.min_ever;
-            document.getElementById('yps').innerText = (d.yps || 0).toFixed(2);
+            // Update Dashboards
+            document.getElementById('era').innerText = data.cycle;
+            document.getElementById('success').innerText = (data.success || 0).toFixed(2);
+            document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
+            document.getElementById('maxr').innerText = data.min_ever;
+            document.getElementById('yps').innerText = (data.yps || 0).toFixed(3);
+            document.getElementById('rcount').innerText = (data.entities || []).filter(e => e.type === 'RADAR').length;
 
-            const entities = d.entities || [];
-            const currentIds = new Set(entities.map(e => e.id));
             const now = Date.now();
+            const currentIds = new Set();
 
-            // 1. Prune missing IDs
-            for (let id in layers) {
-                if (!currentIds.has(id)) {
-                    map.removeLayer(layers[id]);
-                    delete layers[id];
-                }
-            }
-            
-            let radarCount = 0;
-            entities.forEach(e => {
+            (data.entities || []).forEach(e => {
+                currentIds.add(e.id);
+                
                 if (!layers[e.id]) {
-                    // 2. Object Recycling - Initial Creation
+                    // Initialize New Entities
                     if (e.type === 'RADAR') {
                         layers[e.id] = L.circle([e.lat, e.lon], {
                             radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false
                         }).addTo(map);
                     } else {
                         layers[e.id] = L.circleMarker([e.lat, e.lon], {
-                            radius: 2, color: '#f00', fillOpacity: 0.6, interactive: false
+                            radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false
                         }).addTo(map);
                     }
                 } else {
-                    // 3. Fast Update - setLatLng on Canvas is extremely cheap
+                    // Real-Time Position Nudge
                     layers[e.id].setLatLng([e.lat, e.lon]);
-                    
-                    if (e.last_moved && (now - e.last_moved < 1000)) {
-                        layers[e.id].setStyle({color: '#ff0', weight: 3, fillOpacity: 0.4});
+
+                    // Action Flash: If e.last_moved is recent, highlight the radar
+                    if (e.last_moved && (now - e.last_moved < 1500)) {
+                        layers[e.id].setStyle({color: '#ff0', weight: 4, fillOpacity: 0.5});
                     } else if (e.type === 'RADAR') {
                         layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
                     }
                 }
-                if (e.type === 'RADAR') radarCount++;
             });
 
-            document.getElementById('rcount').innerText = radarCount;
-            document.getElementById('maxr').innerText = d.min_ever;
+            // Cleanup Pruned Radars
+            for (let id in layers) {
+                if (!currentIds.has(id)) {
+                    map.removeLayer(layers[id]);
+                    delete layers[id];
+                }
+            }
 
-        } catch (err) {
-            console.warn("UI Sync throttled");
-        } finally {
-            isSyncing = false;
-            // Adaptive polling: won't queue if the previous frame isn't done
-            setTimeout(sync, 250); 
-        }
+        } catch (e) { console.error("Sync drop:", e); }
+        
+        isFetching = false;
     }
 
-    sync();
+    // Use a high-frequency interval to capture AI "nudges" smoothly
+    setInterval(updateUI, 150); 
 </script></body></html>`
