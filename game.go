@@ -398,6 +398,11 @@ func runPhysicsEngine() {
 					target := entities[cityNames[rand.Intn(len(cityNames))]]
 					mu.RUnlock()
 
+					// NEW SAFETY CHECK: prevent nil pointer dereference
+					if target == nil {
+						continue
+					}
+
 					intercepted := false
 					targetGrid := getGridID(target.Lat, target.Lon)
 
@@ -636,17 +641,33 @@ func main() {
 	go runPhysicsEngine()
 
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
+		mu.Lock() // Block physics engine from starting a new batch
+
+		// 1. Reset Brain and Capital
 		brain = NewBrain(mutationRate)
-		budget = 500000.0                   // Restore starting capital
-		entities = make(map[string]*Entity) // Clear the failed 0-radar state
+		budget = 500000.0
+
+		// 2. Clear and Re-populate Entities
+		entities = make(map[string]*Entity)
+		cityNames = []string{} // Reset the slice to prevent stale index lookups
+
 		for name, pos := range cityData {
 			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
+			cityNames = append(cityNames, name)
 		}
+
+		// 3. Re-seed initial radars so physics has targets
+		for i := 0; i < MinRadars; i++ {
+			id := fmt.Sprintf("R-START-%d", i)
+			lat, lon := getTetheredCoords()
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
+		}
+
 		forceReset = true
 		mu.Unlock()
 		w.Write([]byte("Shield Re-initialized"))
 	})
+
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
