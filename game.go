@@ -192,8 +192,6 @@ func getTetheredCoords() (float64, float64) {
 }
 
 func saveSystemState() {
-	mu.RLock()
-	defer mu.RUnlock()
 
 	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
 	f, err := os.Create(BrainFile)
@@ -335,57 +333,64 @@ func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 
 func runPhysicsEngine() {
 	for {
+		// 1. ERA TRANSITION CHECK
 		mu.Lock()
 		if simClock.IsZero() {
 			simClock = time.Now()
 			eraStartTime = time.Now()
 		}
 
-		// Handle Era Transitions
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
 			autonomousEraReset()
 			continue
 		}
+		mu.Unlock() // Release to let UI /intel handler work during math
 
-		// --- 1,000 THREAT BATCH ---
-		const batchSize = 1000
-		for b := 0; b < batchSize; b++ {
-			totalThreats++
+		// 2. THREAT BATCH (1,000 cycles)
+		for b := 0; b < 1000; b++ {
+			mu.RLock()
 			target := entities[cityNames[rand.Intn(len(cityNames))]]
-			intercepted := false
+			mu.RUnlock()
 
-			// Check for interception
+			intercepted := false
+			// Check distance without holding a long-term lock
 			for id, e := range entities {
 				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
+					mu.Lock()
 					kills[id]++
-					budget += InterceptReward
 					totalIntercepts++
+					budget += InterceptReward
+					mu.Unlock()
 					intercepted = true
 					break
 				}
 			}
 
 			if !intercepted {
+				mu.Lock()
 				budget -= CityImpactPenalty
-				// SPATIAL MEMORY: Log which quadrant the miss occurred in
-				// Indexing: 0:NW, 1:NE, 2:SW, 3:SE
+				totalThreats++
+				// Update Spatial Memory Quadrants
 				qIdx := 0
 				if target.Lat < 0 {
 					qIdx += 2
-				} // South
+				}
 				if target.Lon > 0 {
 					qIdx += 1
-				} // East
+				}
 				quadrantMisses[qIdx]++
+				mu.Unlock()
 			}
-			simClock = simClock.Add(4 * time.Hour)
 		}
 
-		// Calculate current performance metrics
+		// 3. AI DECISION PHASE
+		mu.Lock()
+		simClock = simClock.Add(4 * time.Hour)
+
 		if totalThreats > 0 {
-			successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
+			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
 
 		rCount := 0
@@ -395,22 +400,20 @@ func runPhysicsEngine() {
 			}
 		}
 
-		// --- AI SPATIAL LOGIC (7-Input Vector) ---
-		// We pass Budget, Density, Success, and the 4 Quadrant Miss-counts
+		// 7-Input Vector for Spatial Learning
 		input := []float64{
 			math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)),
 			float64(rCount) / float64(MaxRadars),
 			successRate / 100.0,
-			math.Min(quadrantMisses[0]/100, 1.0), // Normalized NW Misses
-			math.Min(quadrantMisses[1]/100, 1.0), // Normalized NE Misses
-			math.Min(quadrantMisses[2]/100, 1.0), // Normalized SW Misses
-			math.Min(quadrantMisses[3]/100, 1.0), // Normalized SE Misses
+			math.Min(quadrantMisses[0]/100, 1.0),
+			math.Min(quadrantMisses[1]/100, 1.0),
+			math.Min(quadrantMisses[2]/100, 1.0),
+			math.Min(quadrantMisses[3]/100, 1.0),
 		}
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
 
-		// Calculate a dynamic multiplier based on failure
-		// Low success = big jumps (up to 20x); High success = tiny adjustments (min 1x)
+		// Adaptive Precision: Moves become smaller as success increases
 		precisionScale := 20.0 * (1.0 - (successRate / 100.0))
 		if precisionScale < 1.0 {
 			precisionScale = 1.0
@@ -418,41 +421,36 @@ func runPhysicsEngine() {
 
 		switch action {
 		case 1: // BUILD NEW
-			// EMERGENCY OVERRIDE: Allow building if below MinRadars regardless of budget
 			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
 				baseLat, baseLon := getTetheredCoords()
-				newLat := baseLat + (latNudge * precisionScale * 2.0) // Aggressive search
+				newLat := baseLat + (latNudge * precisionScale * 2.0)
 				newLon := baseLon + (lonNudge * precisionScale * 2.0)
 				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
 				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: newLat, Lon: newLon}
 				budget -= RadarCost
 			}
-
-		case 2: // RELOCATE WORST PERFORMER
-			if budget >= RelocationCost && rCount > 0 {
-				var worstID string
-				minKills := 999999
-				for id, count := range kills {
-					if entities[id].Type == "RADAR" && count < minKills {
-						minKills = count
-						worstID = id
-					}
+		case 2: // RELOCATE WORST
+			var worstID string
+			minKills := 999999
+			for id, count := range kills {
+				if entities[id].Type == "RADAR" && count < minKills {
+					minKills = count
+					worstID = id
 				}
-				if e, ok := entities[worstID]; ok {
-					baseLat, baseLon := getTetheredCoords()
-					// Relocation uses raw precision scale for surgical placement
-					e.Lat = baseLat + (latNudge * precisionScale)
-					e.Lon = baseLon + (lonNudge * precisionScale)
-					e.LastMoved = time.Now().UnixMilli()
-					kills[worstID] = 0
-					budget -= RelocationCost
-				}
+			}
+			if e, ok := entities[worstID]; ok && budget >= RelocationCost {
+				baseLat, baseLon := getTetheredCoords()
+				e.Lat = baseLat + (latNudge * precisionScale)
+				e.Lon = baseLon + (lonNudge * precisionScale)
+				e.LastMoved = time.Now().UnixMilli()
+				kills[worstID] = 0
+				budget -= RelocationCost
 			}
 		}
 		mu.Unlock()
 
-		// Breather for the HTTP scheduler to prevent UI update starvation
-		time.Sleep(1 * time.Millisecond)
+		// 4. BREATHER: Vital for UI responsiveness
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -620,7 +618,7 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS AI OPTIMIZER v2</title>
+<!DOCTYPE html><html><head><title>AEGIS AI OPTIMIZER v3 - CANVAS</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -645,12 +643,18 @@ const uiHTML = `
     <div class="stat-row"><span>BUDGET:</span> $<span id="budget" class="stat-val">0</span></div>
     <div class="stat-row"><span>SPEED:</span> <span id="yps" class="stat-val">0</span> Y/sec</div>
     <div class="legend">
-        <span style="color:#0f0">●</span> Coverage <span style="color:#f00">●</span> Target <span style="color:#ff0">●</span> Moving
+        <span style="color:#0f0">●</span> Coverage <span style="color:#f00">●</span> Target <span style="color:#ff0">●</span> Nudge
     </div>
 </div>
 <div id="map"></div>
 <script>
-    var map = L.map('map', {zoomControl:false, attributionControl:false}).setView([20, 0], 2);
+    // CRITICAL: preferCanvas: true offloads rendering to the GPU
+    var map = L.map('map', {
+        zoomControl:false, 
+        attributionControl:false,
+        preferCanvas: true 
+    }).setView([20, 0], 2);
+
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
     
     var layers = {};
@@ -662,22 +666,20 @@ const uiHTML = `
 
         try {
             const r = await fetch('/intel'); 
-            if (!r.ok) throw new Error('Backend Starved');
+            if (!r.ok) throw new Error('Network Busy');
             const d = await r.json();
 
-            // 1. Update UI Elements
             document.getElementById('era').innerText = d.cycle;
             document.getElementById('success').innerText = (d.success || 0).toFixed(1);
             document.getElementById('budget').innerText = Math.floor(d.budget).toLocaleString();
             document.getElementById('min_ever').innerText = d.min_ever;
-            document.getElementById('maxr').innerText = d.min_ever;
             document.getElementById('yps').innerText = (d.yps || 0).toFixed(2);
 
             const entities = d.entities || [];
             const currentIds = new Set(entities.map(e => e.id));
             const now = Date.now();
 
-            // 2. Prune Dead Layers (Optimized)
+            // 1. Prune missing IDs
             for (let id in layers) {
                 if (!currentIds.has(id)) {
                     map.removeLayer(layers[id]);
@@ -688,40 +690,40 @@ const uiHTML = `
             let radarCount = 0;
             entities.forEach(e => {
                 if (!layers[e.id]) {
-                    // Create New
+                    // 2. Object Recycling - Initial Creation
                     if (e.type === 'RADAR') {
                         layers[e.id] = L.circle([e.lat, e.lon], {
-                            radius: 1200000, color: '#0f0', weight: 0.5, fillOpacity: 0.1
+                            radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false
                         }).addTo(map);
                     } else {
                         layers[e.id] = L.circleMarker([e.lat, e.lon], {
-                            radius: 3, color: '#f00', weight: 1, fillOpacity: 0.5
+                            radius: 2, color: '#f00', fillOpacity: 0.6, interactive: false
                         }).addTo(map);
                     }
                 } else {
-                    // Update Existing (Throttled Move)
+                    // 3. Fast Update - setLatLng on Canvas is extremely cheap
                     layers[e.id].setLatLng([e.lat, e.lon]);
                     
-                    // Flash Logic for Relocation
-                    if (e.last_moved && (now - e.last_moved < 1200)) {
-                        layers[e.id].setStyle({color: '#ff0', weight: 3, fillOpacity: 0.5});
+                    if (e.last_moved && (now - e.last_moved < 1000)) {
+                        layers[e.id].setStyle({color: '#ff0', weight: 3, fillOpacity: 0.4});
                     } else if (e.type === 'RADAR') {
-                        layers[e.id].setStyle({color: '#0f0', weight: 0.5, fillOpacity: 0.1});
+                        layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
                     }
                 }
                 if (e.type === 'RADAR') radarCount++;
             });
 
             document.getElementById('rcount').innerText = radarCount;
+            document.getElementById('maxr').innerText = d.min_ever;
 
         } catch (err) {
-            console.warn("Sync throttled:", err.message);
+            console.warn("UI Sync throttled");
         } finally {
             isSyncing = false;
-            // Recursive timeout prevents request overlap
-            setTimeout(sync, 400); 
+            // Adaptive polling: won't queue if the previous frame isn't done
+            setTimeout(sync, 250); 
         }
     }
 
-    sync(); // Boot up the loop
+    sync();
 </script></body></html>`
