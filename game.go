@@ -19,6 +19,7 @@ import (
 
 const (
 	RadarRadiusKM     = 1200.0
+	TetherRadiusKM    = 800.0 // NEW: Max distance from a city
 	RadarCost         = 500.0
 	EnforcementFee    = 1000.0
 	MaxRadars         = 500
@@ -73,10 +74,8 @@ func NewBrain(multiplier float64) *Brain {
 	x := gorgonia.NewVector(g, tensor.Float64, gorgonia.WithShape(3), gorgonia.WithName("x"))
 	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(3, 12), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(12, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-
 	l0 := gorgonia.Must(gorgonia.Rectify(gorgonia.Must(gorgonia.Mul(x, w0))))
 	out := gorgonia.Must(gorgonia.SoftMax(gorgonia.Must(gorgonia.Mul(l0, w1))))
-
 	vm := gorgonia.NewTapeMachine(g)
 	return &Brain{g: g, w0: w0, w1: w1, x: x, out: out, vm: vm}
 }
@@ -94,8 +93,6 @@ func (b *Brain) Predict(input []float64) int {
 	}
 	return maxIdx
 }
-
-// ... (SaveWeights, LoadWeights, and saveSystemState remain identical to previous version)
 
 func (b *Brain) SaveWeights() {
 	f, _ := os.Create(BrainFile)
@@ -122,6 +119,17 @@ func (b *Brain) LoadWeights() {
 	}
 }
 
+func getTetheredCoords() (float64, float64) {
+	city := entities[cityNames[rand.Intn(len(cityNames))]]
+	// 800km is approx 7.2 degrees. We jitter within that range.
+	lat := city.Lat + (rand.Float64()-0.5)*14.0
+	lon := city.Lon + (rand.Float64()-0.5)*14.0
+	if getDistanceKM(city.Lat, city.Lon, lat, lon) > TetherRadiusKM {
+		return city.Lat, city.Lon // Fallback to city center if jitter exceeds radius
+	}
+	return lat, lon
+}
+
 func saveSystemState() {
 	brain.SaveWeights()
 	var opt []Entity
@@ -137,15 +145,13 @@ func saveSystemState() {
 func autonomousEraReset() {
 	mu.Lock()
 	defer mu.Unlock()
-
-	if successRate >= 100.0 && totalThreats >= 50 {
-		fmt.Printf("\n[!] TERMINATING: 100%% INTERCEPTION ACHIEVED.\n")
+	if successRate >= 99.0 && totalThreats >= 50 {
+		fmt.Printf("\n[!] STABLE 99%% REACHED. MISSION COMPLETE.\n")
 		saveSystemState()
 		os.Exit(0)
 	}
-
 	if totalEraSpending > BankruptcyLimit {
-		fmt.Printf("!!! BANKRUPTCY !!! Resetting weights...\n")
+		fmt.Println("[!] BANKRUPTCY: RESTARTING BRAIN")
 		brain = NewBrain(mutationRate)
 		for id, e := range entities {
 			if e.Type == "RADAR" {
@@ -155,7 +161,6 @@ func autonomousEraReset() {
 		}
 		goto FinalizeReset
 	}
-
 	{
 		rCount := 0
 		for _, e := range entities {
@@ -163,8 +168,7 @@ func autonomousEraReset() {
 				rCount++
 			}
 		}
-
-		if successRate >= 98.0 {
+		if successRate >= 95.0 {
 			saveSystemState()
 			for id, k := range kills {
 				if k == 0 {
@@ -174,43 +178,16 @@ func autonomousEraReset() {
 					kills[id] = 0
 				}
 			}
-		} else if successRate >= 95.0 {
-			prunePercent := (successRate - 90.0) / 100.0
-			var ids []string
-			for id, e := range entities {
-				if e.Type == "RADAR" {
-					ids = append(ids, id)
-				}
-			}
-			rand.Shuffle(len(ids), func(i, j int) { ids[i], ids[j] = ids[j], ids[i] })
-			numToPrune := int(float64(len(ids)) * prunePercent)
-			if rCount-numToPrune < MinRadars {
-				numToPrune = rCount - MinRadars
-			}
-			for i := 0; i < numToPrune; i++ {
-				delete(entities, ids[i])
-				delete(kills, ids[i])
-			}
 		} else {
 			for id := range kills {
 				kills[id] = 0
 			}
 		}
-
-		currentRCount := 0
-		for _, e := range entities {
-			if e.Type == "RADAR" {
-				currentRCount++
-			}
-		}
-		if successRate >= 95.0 && currentRCount >= MinRecordLimit && currentRCount <= MaxRecordLimit {
-			if currentRCount < minRadarEver {
-				minRadarEver = currentRCount
-				saveSystemState()
-			}
+		if successRate >= 95.0 && rCount < minRadarEver {
+			minRadarEver = rCount
+			saveSystemState()
 		}
 	}
-
 FinalizeReset:
 	currentCycle++
 	eraStartTime = simClock
@@ -228,14 +205,12 @@ func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 }
 
 func runPhysicsEngine() {
-	// TICKER REMOVED - Using a tight loop for maximum CPU utilization
 	for {
 		mu.Lock()
 		if simClock.IsZero() {
 			simClock = time.Now()
 			eraStartTime = time.Now()
 		}
-
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
@@ -251,17 +226,16 @@ func runPhysicsEngine() {
 		}
 
 		if rCount < MinRadars {
-			needed := MinRadars - rCount
-			for i := 0; i < needed; i++ {
+			for i := 0; i < (MinRadars - rCount); i++ {
 				id := fmt.Sprintf("R-REG-%d-%d", currentCycle, i)
-				c := entities[cityNames[rand.Intn(len(cityNames))]]
-				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: c.Lat + (rand.Float64()-0.5)*30, Lon: c.Lon + (rand.Float64()-0.5)*30}
+				lat, lon := getTetheredCoords()
+				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
 				budget -= EnforcementFee
 				totalEraSpending += EnforcementFee
 			}
 		}
 
-		timeStep := 1 * time.Hour
+		timeStep := 4 * time.Hour
 		simClock = simClock.Add(timeStep)
 		totalThreats++
 		target := entities[cityNames[rand.Intn(len(cityNames))]]
@@ -280,24 +254,20 @@ func runPhysicsEngine() {
 		}
 		successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 
-		// AI DECISION
 		desperation := 0.0
 		if successRate < 90.0 {
 			desperation = (90.0 - successRate) / 100.0
 		}
-
 		input := []float64{math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)), float64(rCount) / 500.0, successRate / 100.0}
 		if (brain.Predict(input) == 1 || rand.Float64() < desperation) && budget >= RadarCost && rCount < MaxRadars {
 			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e6))
-			c := entities[cityNames[rand.Intn(len(cityNames))]]
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: c.Lat + (rand.Float64()-0.5)*30, Lon: c.Lon + (rand.Float64()-0.5)*30}
+			lat, lon := getTetheredCoords()
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
 			budget -= RadarCost
 			totalEraSpending += RadarCost
 		}
 		mu.Unlock()
-
-		// Small sleep to prevent UI lockup while still running at warp speed
-		if totalThreats%10 == 0 {
+		if totalThreats%20 == 0 {
 			time.Sleep(1 * time.Microsecond)
 		}
 	}
@@ -337,6 +307,12 @@ func main() {
 	setupSimulation()
 	go runPhysicsEngine()
 
+	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		brain = NewBrain(mutationRate)
+		forceReset = true
+		mu.Unlock()
+	})
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
@@ -344,17 +320,17 @@ func main() {
 		for _, e := range entities {
 			all = append(all, *e)
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"cycle": currentCycle, "budget": budget, "entities": all, "success": successRate, "min_ever": minRadarEver, "spending": totalEraSpending})
+		json.NewEncoder(w).Encode(map[string]interface{}{"cycle": currentCycle, "budget": budget, "entities": all, "success": successRate, "min_ever": minRadarEver})
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
-	fmt.Println("AEGIS TURBO-START :8080")
+	fmt.Println("AEGIS TETHERED BOOT :8080")
 	http.ListenAndServe(":8080", nil)
 }
 
 func setupSimulation() {
-	brain = NewBrain(mutationRate) // Pre-initialize brain structure
+	brain = NewBrain(mutationRate)
 	if data, err := os.ReadFile(RadarFile); err == nil {
 		var saved []Entity
 		json.Unmarshal(data, &saved)
@@ -369,11 +345,11 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS TURBO</title>
+<!DOCTYPE html><html><head><title>AEGIS</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>body { margin:0; background:#000; color:#0f0; font-family:monospace; } #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af;} #map { height:100vh; width:100vw; }</style></head>
-<body><div id="stats">ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>SUCCESS: <span id="success">0</span>% | BEST MIN: <span id="minr">0</span></div><div id="map"></div>
+<style>body { margin:0; background:#000; color:#0f0; font-family:monospace; } #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af;} button { background:#f00; color:#fff; border:none; padding:5px; margin-top:5px; cursor:pointer;} #map { height:100vh; width:100vw; }</style></head>
+<body><div id="stats">ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>SUCCESS: <span id="success">0</span>% | MIN: <span id="minr">0</span><br><button onclick="fetch('/panic')">PANIC: RESET BRAIN</button></div><div id="map"></div>
 <script>
     var map = L.map('map', {zoomControl:false}).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
@@ -393,5 +369,5 @@ const uiHTML = `
         });
         document.getElementById('rcount').innerText = d.entities.filter(e => e.type === 'RADAR').length;
     }
-    setInterval(sync, 500); // UI Refresh remains human-readable
+    setInterval(sync, 500);
 </script></body></html>`
