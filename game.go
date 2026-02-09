@@ -33,6 +33,9 @@ const (
 	RadarFile         = "RADAR.json"
 	BrainFile         = "BRAIN.gob"
 	BankruptcyLimit   = 1500000.0
+	GridSize          = 10 // 10 degree cells
+	Cols              = 36 // 360 / 10
+	Rows              = 18 // 180 / 10
 )
 
 var (
@@ -92,6 +95,13 @@ func (b *Brain) AdaptiveMutate(success float64) {
 	// Low success (50%) = large jitter (0.2)
 	rate := 0.2 * (1.0 - (success / 100.0))
 	b.Mutate(rate)
+}
+
+// Helper to get grid ID from coordinates
+func getGridID(lat, lon float64) int {
+	row := int((lat + 90) / GridSize)
+	col := int((lon + 180) / GridSize)
+	return row*Cols + col
 }
 
 func NewBrain(multiplier float64) *Brain {
@@ -340,7 +350,7 @@ func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 
 func runPhysicsEngine() {
 	for {
-		// 1. ERA TRANSITION CHECK
+		// 2. ERA TRANSITION & SPATIAL INDEXING
 		mu.Lock()
 		if simClock.IsZero() {
 			simClock = time.Now()
@@ -352,45 +362,66 @@ func runPhysicsEngine() {
 			autonomousEraReset()
 			continue
 		}
+
+		// Rebuild Spatial Index for this batch
+		spatialIndex := make(map[int][]string)
+		for id, e := range entities {
+			if e.Type == "RADAR" {
+				gID := getGridID(e.Lat, e.Lon)
+				spatialIndex[gID] = append(spatialIndex[gID], id)
+			}
+		}
 		mu.Unlock()
 
-		// 2. MULTI-THREADED THREAT BATCH (Parallelized)
+		// 3. MULTI-THREADED THREAT BATCH (Spatial Optimized)
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
 		batchSize := 1000
 
-		// Optimization: Use local accumulation to minimize lock contention
 		for w := 0; w < numWorkers; w++ {
 			wg.Add(1)
-			go func(workerID int) {
+			go func() {
 				defer wg.Done()
 				localKills := make(map[string]int)
 				localMisses := make([]float64, 4)
-				localIntercepts, localThreats, localReward, localPenalty := 0, 0, 0.0, 0.0
+				lInt, lThr, lRew, lPen := 0, 0, 0.0, 0.0
 
-				iterations := batchSize / numWorkers
-				for i := 0; i < iterations; i++ {
+				for i := 0; i < batchSize/numWorkers; i++ {
 					mu.RLock()
 					target := entities[cityNames[rand.Intn(len(cityNames))]]
 					mu.RUnlock()
 
 					intercepted := false
-					// RLock for distance check to keep UI fluid
+					targetGrid := getGridID(target.Lat, target.Lon)
+
+					// Only check target cell and neighbors
 					mu.RLock()
-					for id, e := range entities {
-						if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
-							localKills[id]++
-							localIntercepts++
-							localReward += InterceptReward
-							intercepted = true
+					for r := -1; r <= 1; r++ {
+						for c := -1; c <= 1; c++ {
+							checkID := targetGrid + (r * Cols) + c
+							for _, radarID := range spatialIndex[checkID] {
+								e := entities[radarID]
+								if getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
+									localKills[radarID]++
+									lInt++
+									lRew += InterceptReward
+									intercepted = true
+									break
+								}
+							}
+							if intercepted {
+								break
+							}
+						}
+						if intercepted {
 							break
 						}
 					}
 					mu.RUnlock()
 
 					if !intercepted {
-						localThreats++
-						localPenalty += CityImpactPenalty
+						lThr++
+						lPen += CityImpactPenalty
 						qIdx := 0
 						if target.Lat < 0 {
 							qIdx += 2
@@ -402,7 +433,7 @@ func runPhysicsEngine() {
 					}
 				}
 
-				// Merge local results to global state once
+				// Final merge: minimizing global lock time
 				mu.Lock()
 				for id, count := range localKills {
 					kills[id] += count
@@ -410,18 +441,18 @@ func runPhysicsEngine() {
 				for i, val := range localMisses {
 					quadrantMisses[i] += val
 				}
-				totalIntercepts += localIntercepts
-				totalThreats += localThreats
-				budget += (localReward - localPenalty)
+				totalIntercepts += lInt
+				totalThreats += lThr
+				budget += (lRew - lPen)
 				mu.Unlock()
-			}(w)
+			}()
 		}
 		wg.Wait()
 
-		// 3. AI DECISION PHASE (Inside Global Lock)
+		// 4. AI DECISION PHASE
 		mu.Lock()
 		simClock = simClock.Add(4 * time.Hour)
-		if totalThreats > 0 {
+		if totalThreats+totalIntercepts > 0 {
 			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
 
@@ -452,8 +483,11 @@ func runPhysicsEngine() {
 		case 1: // BUILD
 			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
 				baseLat, baseLon := getTetheredCoords()
-				entities[fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))] = &Entity{
-					Type: "RADAR", Lat: baseLat + (latNudge * precisionScale * 2.0), Lon: baseLon + (lonNudge * precisionScale * 2.0),
+				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+				entities[id] = &Entity{
+					ID: id, Type: "RADAR",
+					Lat: baseLat + (latNudge * precisionScale * 2.0),
+					Lon: baseLon + (lonNudge * precisionScale * 2.0),
 				}
 				budget -= RadarCost
 			}
@@ -477,7 +511,7 @@ func runPhysicsEngine() {
 		}
 		mu.Unlock()
 
-		// 4. BREATHER: Essential for the HTTP server to serve the UI
+		// Vital breather for UI network stack
 		time.Sleep(2 * time.Millisecond)
 	}
 }
