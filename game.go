@@ -23,27 +23,27 @@ const (
 	TetherRadiusKM    = 800.0
 	RadarCost         = 500.0
 	RelocationCost    = 50.0
-	EnforcementFee    = 1000.0
+	EnforcementFee    = 50000.0
 	MinRadars         = 60
-	CityImpactPenalty = 4500.0
-	InterceptReward   = 6000.0
-	EfficiencyBonus   = 35000.0
+	CityImpactPenalty = 1000000.0
+	InterceptReward   = 25000.0
+	EfficiencyBonus   = 100000.0
 	EarthRadius       = 6371.0
 	EraDuration       = 24 * time.Hour
 	RadarFile         = "RADAR.json"
 	BrainFile         = "BRAIN.gob"
-	BankruptcyLimit   = 1500000.0
+	BankruptcyLimit   = 0.0
 	GridSize          = 10 // 10 degree cells
 	Cols              = 36 // 360 / 10
 	Rows              = 18 // 180 / 10
 	TargetSuccess     = 100.0
-	RequiredWinStreak = 1 // Number of eras to maintain 100% before "winning"
+	RequiredWinStreak = 200 // Number of eras to maintain 100% before "winning"
 )
 
 var (
 	entities         = make(map[string]*Entity)
 	kills            = make(map[string]int)
-	budget           = 2000000.0
+	budget           = 2000000000.0
 	totalEraSpending = 0.0
 	mu               sync.RWMutex
 	eraStartTime     time.Time
@@ -244,7 +244,7 @@ func autonomousEraReset() {
 	defer mu.Unlock()
 
 	// 1. EVALUATE WIN STREAK
-	if successRate >= 100.0 && totalThreats > 50 {
+	if successRate >= 100.0 && (totalThreats+totalIntercepts) > 50 {
 		winStreakCounter++
 		fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
 
@@ -283,12 +283,12 @@ func autonomousEraReset() {
 	// 2. DETECT STAGNATION
 	if rCount < MinRadars && budget < RadarCost {
 		fmt.Println("STAGNATION DETECTED: Emergency Capital Injection...")
-		budget = 500000.0
+		budget = 20000000.0
 		brain.Mutate(0.2)
 	}
 
 	// 3. TARGET SCALING
-	if successRate >= 99.0 && totalThreats >= 50 {
+	if successRate >= 99.9 && totalThreats >= 50 {
 		if rCount < minEverRadars {
 			minEverRadars = rCount
 			MaxRadars = minEverRadars // Lower the ceiling for the AI
@@ -301,7 +301,7 @@ func autonomousEraReset() {
 	if budget < -BankruptcyLimit {
 		fmt.Println("\nCRISIS: Re-seeding Brain weights...")
 		brain.Mutate(0.1)
-		budget = 500000.0
+		budget = 20000000.0
 	}
 
 	// 5. AGGRESSIVE PRUNING
@@ -474,10 +474,10 @@ func runPhysicsEngine() {
 			math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)),
 			float64(rCount) / float64(MaxRadars),
 			successRate / 100.0,
-			math.Min(quadrantMisses[0]/100, 1.0),
-			math.Min(quadrantMisses[1]/100, 1.0),
-			math.Min(quadrantMisses[2]/100, 1.0),
-			math.Min(quadrantMisses[3]/100, 1.0),
+			math.Min(quadrantMisses[0]/50, 1.0),
+			math.Min(quadrantMisses[1]/50, 1.0),
+			math.Min(quadrantMisses[2]/50, 1.0),
+			math.Min(quadrantMisses[3]/50, 1.0),
 		}
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
@@ -793,7 +793,7 @@ const uiHTML = `
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
             document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
-            document.getElementById('streak').innerText = (data.streak || 0) + " / 1";
+            document.getElementById('streak').innerText = (data.streak || 0) + " / 200";
 
             const now = Date.now();
             const currentIds = new Set();
