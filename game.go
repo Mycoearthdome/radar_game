@@ -21,13 +21,12 @@ import (
 const (
 	RadarRadiusKM     = 1200.0
 	TetherRadiusKM    = 800.0
-	RadarCost         = 500.0
-	RelocationCost    = 50.0
-	EnforcementFee    = 50000.0
+	RadarCost         = 50000.0
+	RelocationCost    = 5000.0
+	EnforcementFee    = 50000000.0
 	MinRadars         = 60
-	CityImpactPenalty = 1000000.0
-	InterceptReward   = 25000.0
-	EfficiencyBonus   = 100000.0
+	CityImpactPenalty = 2000000.0
+	InterceptReward   = 1000000.0
 	EarthRadius       = 6371.0
 	EraDuration       = 24 * time.Hour
 	RadarFile         = "RADAR.json"
@@ -62,6 +61,7 @@ var (
 	quadrantMisses   = make([]float64, 4) // [NW, NE, SW, SE]
 	winStreakCounter = 0
 	isSimulationOver = false
+	EfficiencyBonus  = 100000.0
 )
 
 type Entity struct {
@@ -85,12 +85,23 @@ func (b *Brain) Mutate(rate float64) {
 	w0Data := b.w0.Value().Data().([]float64)
 	w1Data := b.w1.Value().Data().([]float64)
 
-	// Apply Gaussian noise: weight = weight + (randn * rate)
+	// Apply improved Gaussian noise + scaling to Hidden Layer
 	for i := range w0Data {
-		w0Data[i] += rand.NormFloat64() * rate
+		if rand.Float64() < 0.9 {
+			w0Data[i] += rand.NormFloat64() * rate
+		} else {
+			// Helps the AI escape "local minima" by scaling the weight
+			w0Data[i] *= (1.0 + (rand.NormFloat64() * rate))
+		}
 	}
+
+	// Apply improved Gaussian noise + scaling to Output Layer
 	for i := range w1Data {
-		w1Data[i] += rand.NormFloat64() * rate
+		if rand.Float64() < 0.9 {
+			w1Data[i] += rand.NormFloat64() * rate
+		} else {
+			w1Data[i] *= (1.0 + (rand.NormFloat64() * rate))
+		}
 	}
 }
 
@@ -244,6 +255,14 @@ func autonomousEraReset() {
 	defer mu.Unlock()
 
 	// 1. EVALUATE WIN STREAK
+	if successRate >= 100.0 {
+		EfficiencyBonus = EfficiencyBonus * 1.1 //reward
+	} else if successRate < 100.0 && successRate >= 99.5 {
+		EfficiencyBonus = EfficiencyBonus * 1.025
+	} else {
+		EfficiencyBonus = 100000.0
+	}
+
 	if successRate >= 100.0 && (totalThreats+totalIntercepts) > 50 {
 		winStreakCounter++
 		fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
@@ -284,24 +303,25 @@ func autonomousEraReset() {
 	if rCount < MinRadars && budget < RadarCost {
 		fmt.Println("STAGNATION DETECTED: Emergency Capital Injection...")
 		budget = 20000000.0
-		brain.Mutate(0.2)
+		brain.AdaptiveMutate(successRate)
 	}
 
 	// 3. TARGET SCALING
-	if successRate >= 99.9 && totalThreats >= 50 {
+	if successRate >= 99.5 && (totalThreats+totalIntercepts) >= 50 {
 		if rCount < minEverRadars {
 			minEverRadars = rCount
 			MaxRadars = minEverRadars // Lower the ceiling for the AI
 			fmt.Printf("\nNEW RECORD: Max fleet size tightened to %d units.\n", MaxRadars)
 			saveSystemState()
+			EfficiencyBonus = 200000.0 //reward
 		}
 	}
 
 	// 4. BANKRUPTCY & ADAPTIVE MUTATION
 	if budget < -BankruptcyLimit {
-		fmt.Println("\nCRISIS: Re-seeding Brain weights...")
-		brain.Mutate(0.1)
-		budget = 20000000.0
+		fmt.Println("\nCRISIS: Mutating Brain weights...")
+		brain.AdaptiveMutate(successRate)
+		budget = 1000000000.0
 	}
 
 	// 5. AGGRESSIVE PRUNING
@@ -407,7 +427,13 @@ func runPhysicsEngine() {
 						for c := -1; c <= 1; c++ {
 							checkID := targetGrid + (r * Cols) + c
 							for _, radarID := range spatialIndex[checkID] {
-								e := entities[radarID]
+								e, exists := entities[radarID]
+
+								// Check BOTH if it exists AND is not nil before accessing fields
+								if !exists || e == nil {
+									continue
+								}
+
 								if getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
 									localKills[radarID]++
 									lInt++
@@ -636,25 +662,21 @@ func main() {
 	go runPhysicsEngine()
 
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock() // Halt the physics engine's ability to start new batches
+		mu.Lock()
 		defer mu.Unlock()
 
-		// 1. Reset Brain & Financials
-		brain = NewBrain(mutationRate)
-		budget = 500000.0
-
-		// 2. Clear Maps Safely
+		// 1. Clear everything first
 		entities = make(map[string]*Entity)
-		cityNames = nil // Force workers to fail the len() check safely
+		cityNames = []string{}
 		kills = make(map[string]int)
 
-		// 3. Rebuild World State
+		// 2. Re-populate cities fully BEFORE workers can resume
 		for name, pos := range cityData {
 			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
 			cityNames = append(cityNames, name)
 		}
 
-		// 4. Re-seed Initial Radar Fleet
+		// 3. Re-seed Radars
 		for i := 0; i < MinRadars; i++ {
 			id := fmt.Sprintf("R-START-%d", i)
 			lat, lon := getTetheredCoords()
