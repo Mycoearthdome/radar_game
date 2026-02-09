@@ -36,6 +36,8 @@ const (
 	GridSize          = 10 // 10 degree cells
 	Cols              = 36 // 360 / 10
 	Rows              = 18 // 180 / 10
+	TargetSuccess     = 100.0
+	RequiredWinStreak = 1000 // Number of eras to maintain 100% before "winning"
 )
 
 var (
@@ -58,6 +60,8 @@ var (
 	cityNames        []string
 	mutationRate     = 1.0
 	quadrantMisses   = make([]float64, 4) // [NW, NE, SW, SE]
+	winStreakCounter = 0
+	isSimulationOver = false
 )
 
 type Entity struct {
@@ -239,6 +243,35 @@ func autonomousEraReset() {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// 1. EVALUATE WIN STREAK
+	if successRate >= 100.0 && totalThreats > 50 {
+		winStreakCounter++
+		fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
+
+		if winStreakCounter >= RequiredWinStreak {
+			fmt.Println("\n==================================================")
+			fmt.Println("CONVERGENCE REACHED: AEGIS SHIELD IS OPTIMIZED")
+			fmt.Printf("Final Fleet Size: %d | Total Eras: %d\n", len(entities)-len(cityNames), currentCycle)
+			fmt.Println("==================================================")
+
+			isSimulationOver = true
+			saveSystemState() // Final save of the champion model
+
+			// Exit the program after a brief delay for the UI to catch the final state
+			go func() {
+				time.Sleep(2 * time.Second)
+				fmt.Println("Shutting down simulation...")
+				os.Exit(0)
+			}()
+			return
+		}
+	} else {
+		if winStreakCounter > 0 {
+			fmt.Printf("\n[!] STREAK BROKEN: Efficiency fell to %.2f%%\n", successRate)
+		}
+		winStreakCounter = 0
+	}
+
 	var radarIDs []string
 	for id, e := range entities {
 		if e.Type == "RADAR" {
@@ -247,60 +280,36 @@ func autonomousEraReset() {
 	}
 	rCount := len(radarIDs)
 
-	// 1. DETECT STAGNATION
+	// 2. DETECT STAGNATION
 	if rCount < MinRadars && budget < RadarCost {
-		fmt.Println("STAGNATION DETECTED: Insufficient funds for recovery fleet. Auto-Resetting...")
-		budget = 500000.0 // Inject emergency capital
-		brain.Mutate(0.2) // Higher mutation to find a new path
+		fmt.Println("STAGNATION DETECTED: Emergency Capital Injection...")
+		budget = 500000.0
+		brain.Mutate(0.2)
 	}
 
-	// 2. RECOVERY SEEDING
-	if rCount < MinRadars || budget < 0 {
-		fmt.Printf("\n[!] RECOVERING: Seeding fleet...\n")
-		for i := 0; i < MinRadars; i++ {
-			id := fmt.Sprintf("R-SEED-%d-%d", currentCycle, i)
-			lat, lon := getTetheredCoords()
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
-		}
-		radarIDs = nil
-		for id, e := range entities {
-			if e.Type == "RADAR" {
-				radarIDs = append(radarIDs, id)
-			}
-		}
-		rCount = len(radarIDs)
-	}
-
-	// 2. TARGET SCALING (The New Logic)
-	// If we hit 99% success, we tighten the noose on the AI.
+	// 3. TARGET SCALING
 	if successRate >= 99.0 && totalThreats >= 50 {
 		if rCount < minEverRadars {
 			minEverRadars = rCount
-
-			// TARGET SCALING: Lower the global limit to the new record.
-			// This prevents the AI from ever "buying back" into inefficiency.
-			MaxRadars = minEverRadars
-
-			fmt.Printf("\nTARGET SCALED: Max fleet size is now %d units.\n", MaxRadars)
+			MaxRadars = minEverRadars // Lower the ceiling for the AI
+			fmt.Printf("\nNEW RECORD: Max fleet size tightened to %d units.\n", MaxRadars)
 			saveSystemState()
 		}
 	}
 
-	// 3. BANKRUPTCY HANDLING
+	// 4. BANKRUPTCY & ADAPTIVE MUTATION
 	if budget < -BankruptcyLimit {
-		fmt.Println("\nCRISIS: Applying Soft Gaussian Mutation...")
-		brain.Mutate(0.1) // 10% jitter to current knowledge
+		fmt.Println("\nCRISIS: Re-seeding Brain weights...")
+		brain.Mutate(0.1)
 		budget = 500000.0
-		goto FinalizeReset
 	}
 
-	// 4. AGGRESSIVE PRUNING
+	// 5. AGGRESSIVE PRUNING
 	if successRate >= 95.0 {
 		sort.Slice(radarIDs, func(i, j int) bool {
 			return kills[radarIDs[i]] < kills[radarIDs[j]]
 		})
 
-		// Drop 15% of the current fleet
 		numToDrop := int(float64(rCount) * 0.15)
 		dropped := 0
 		for i := 0; i < numToDrop; i++ {
@@ -312,37 +321,23 @@ func autonomousEraReset() {
 			delete(kills, id)
 			dropped++
 
-			// Efficiency Bonus rewards smaller fleet sizes
+			// Reward for doing more with less
 			scalingFactor := 1.0 + (100.0 / float64(len(entities)-len(cityNames)+1))
 			budget += EfficiencyBonus * scalingFactor
 		}
-
-		// Benchmark Mode: Calculate KM2 Efficiency
-		// Area of circle = PI * r^2.
-		radarArea := math.Pi * math.Pow(RadarRadiusKM, 2)
-		theoreticalCoverage := float64(len(radarIDs)-dropped) * radarArea
-		rCount = rCount - dropped
-		effectiveArea := theoreticalCoverage * (successRate / 100.0) // Adjusted for actual hits
-
-		fmt.Printf("PERFORMANCE: %.2f Million KM2 of ACTIVE protection.\n", effectiveArea/1e6)
-
-		fmt.Printf("[+] ERA %d: Success %.1f%% | Limit: %d | Dropped: %d\n", currentCycle, successRate, MaxRadars, dropped)
 		saveSystemState()
 	}
 
+	// 6. FINALIZE ERA
 	for id := range kills {
 		kills[id] = 0
 	}
-
-FinalizeReset:
 	currentCycle++
 	eraStartTime = simClock
 	if budget < 500000.0 {
 		budget = 500000.0
 	}
-	totalEraSpending = 0
-	totalThreats = 0
-	totalIntercepts = 0
+	totalThreats, totalIntercepts = 0, 0
 	for i := range quadrantMisses {
 		quadrantMisses[i] = 0
 	}
@@ -693,10 +688,12 @@ func main() {
 			"budget":   budget,
 			"entities": all,
 			"success":  successRate,
-			"min_ever": minEverRadars, // Missing in your current version
-			"yps":      yps,           // You can calculate this as wall-time vs sim-time
+			"streak":   winStreakCounter,
+			"isOver":   isSimulationOver,
+			"yps":      yps,
 		})
 	})
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
@@ -718,7 +715,7 @@ const uiHTML = `
     #stats { 
         position:fixed; top:15px; left:15px; z-index:1000; 
         background:rgba(0,15,30,0.95); padding:20px; border:2px solid #0af; 
-        box-shadow: 0 0 20px #0af; border-radius: 4px;
+        box-shadow: 0 0 20px #0af; border-radius: 4px; width: 260px;
     } 
     #map { height:100vh; width:100vw; background: #000; }
     .stat-line { font-size: 1.1em; margin-bottom: 5px; border-bottom: 1px solid #0af3; }
@@ -731,6 +728,7 @@ const uiHTML = `
         transition: 0.3s;
     }
     #panic-btn:hover { background: #f00; color: #000; }
+    #win-progress { color: #f0f; font-weight: bold; }
 </style></head>
 <body>
 <div id="stats">
@@ -738,6 +736,7 @@ const uiHTML = `
     <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
     <div class="stat-line">FLEET: <span id="rcount" class="val">0</span> / <span id="maxr" class="highlight">0</span></div>
     <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
+    <div class="stat-line">WIN STREAK: <span id="streak" class="val highlight">0 / 10</span></div>
     <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
     <button id="panic-btn" onclick="triggerPanic()">MANUAL SYSTEM RESET</button>
@@ -749,12 +748,12 @@ const uiHTML = `
     
     var layers = {};
     var isFetching = false;
-    var stallCount = 0; // Watchdog counter
+    var stallCount = 0;
 
     async function triggerPanic() {
         document.getElementById('status').innerText = "REBOOTING...";
         document.getElementById('status').style.color = "#f00";
-        await fetch('/panic');
+        await fetch('/panic'); //
         setTimeout(() => {
             document.getElementById('status').innerText = "ACTIVE";
             document.getElementById('status').style.color = "#0f0";
@@ -769,38 +768,51 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // Watchdog Logic: If YPS is 0, increment stall count
+            // Handle Mission Over
+            if (data.isOver) {
+                document.getElementById('status').innerText = "SHIELD CONVERGED";
+                document.getElementById('status').style.color = "#f0f";
+                document.getElementById('streak').innerText = "COMPLETED";
+                return; 
+            }
+
+            // Watchdog: Auto-reset if the simulation engine stops iterating
             if (data.yps <= 0) {
                 stallCount++;
-                if (stallCount > 40) { // Approx 6 seconds of 0 YPS at 150ms interval
-                    console.warn("Stall detected. Auto-resetting...");
+                if (stallCount > 40) { // Approx 6s of no movement
                     triggerPanic();
                     stallCount = 0;
                 }
-            } else {
-                stallCount = 0;
-            }
+            } else { stallCount = 0; }
 
+            // Sync Stats
             document.getElementById('era').innerText = data.cycle;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
             document.getElementById('maxr').innerText = data.min_ever;
-            document.getElementById('yps').innerText = (data.yps || 0).toFixed(3);
-            document.getElementById('rcount').innerText = (data.entities || []).filter(e => e.type === 'RADAR').length;
-
+            document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
+            document.getElementById('streak').innerText = (data.streak || 0) + " / 1000";
+            
             const now = Date.now();
             const currentIds = new Set();
+            let radarCount = 0;
 
             (data.entities || []).forEach(e => {
                 currentIds.add(e.id);
+                if (e.type === 'RADAR') radarCount++;
+
                 if (!layers[e.id]) {
+                    // Create marker
                     if (e.type === 'RADAR') {
                         layers[e.id] = L.circle([e.lat, e.lon], { radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false }).addTo(map);
                     } else {
                         layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false }).addTo(map);
                     }
                 } else {
+                    // Update Position
                     layers[e.id].setLatLng([e.lat, e.lon]);
+                    
+                    // Visual feedback for AI relocations
                     if (e.last_moved && (now - e.last_moved < 1500)) {
                         layers[e.id].setStyle({color: '#ff0', weight: 4, fillOpacity: 0.5});
                     } else if (e.type === 'RADAR') {
@@ -809,11 +821,16 @@ const uiHTML = `
                 }
             });
 
+            document.getElementById('rcount').innerText = radarCount;
+
+            // Remove dead entities
             for (let id in layers) {
                 if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
-        } catch (e) { console.error("Sync drop:", e); }
+        } catch (e) { console.error("UI Sync drop:", e); }
         isFetching = false;
     }
+    
+    // Refresh at high speed to capture real-time AI "nudges"
     setInterval(updateUI, 150); 
 </script></body></html>`
