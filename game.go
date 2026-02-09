@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 
@@ -19,15 +20,14 @@ import (
 
 const (
 	RadarRadiusKM     = 1200.0
-	TetherRadiusKM    = 800.0 // NEW: Max distance from a city
+	TetherRadiusKM    = 800.0
 	RadarCost         = 500.0
 	EnforcementFee    = 1000.0
 	MaxRadars         = 500
 	MinRadars         = 60
-	MinRecordLimit    = 100
-	MaxRecordLimit    = 200
 	CityImpactPenalty = 5000.0
 	InterceptReward   = 4500.0
+	EfficiencyBonus   = 10000.0
 	EarthRadius       = 6371.0
 	EraDuration       = 24 * time.Hour
 	RadarFile         = "RADAR.json"
@@ -121,11 +121,10 @@ func (b *Brain) LoadWeights() {
 
 func getTetheredCoords() (float64, float64) {
 	city := entities[cityNames[rand.Intn(len(cityNames))]]
-	// 800km is approx 7.2 degrees. We jitter within that range.
 	lat := city.Lat + (rand.Float64()-0.5)*14.0
 	lon := city.Lon + (rand.Float64()-0.5)*14.0
 	if getDistanceKM(city.Lat, city.Lon, lat, lon) > TetherRadiusKM {
-		return city.Lat, city.Lon // Fallback to city center if jitter exceeds radius
+		return city.Lat, city.Lon
 	}
 	return lat, lon
 }
@@ -145,49 +144,61 @@ func saveSystemState() {
 func autonomousEraReset() {
 	mu.Lock()
 	defer mu.Unlock()
+
+	var radarIDs []string
+	for id, e := range entities {
+		if e.Type == "RADAR" {
+			radarIDs = append(radarIDs, id)
+		}
+	}
+	rCount := len(radarIDs)
+
 	if successRate >= 99.0 && totalThreats >= 50 {
-		fmt.Printf("\n[!] STABLE 99%% REACHED. MISSION COMPLETE.\n")
+		fmt.Printf("\n[!] TARGET REACHED: 99%% AT %d UNITS.\n", rCount)
 		saveSystemState()
 		os.Exit(0)
 	}
+
 	if totalEraSpending > BankruptcyLimit {
-		fmt.Println("[!] BANKRUPTCY: RESTARTING BRAIN")
+		fmt.Println("[!] BANKRUPTCY: REBOOTING BRAIN")
 		brain = NewBrain(mutationRate)
-		for id, e := range entities {
-			if e.Type == "RADAR" {
-				delete(entities, id)
-				delete(kills, id)
-			}
+		for _, id := range radarIDs {
+			delete(entities, id)
+			delete(kills, id)
 		}
 		goto FinalizeReset
 	}
-	{
-		rCount := 0
-		for _, e := range entities {
-			if e.Type == "RADAR" {
-				rCount++
-			}
-		}
-		if successRate >= 95.0 {
-			saveSystemState()
-			for id, k := range kills {
-				if k == 0 {
-					delete(entities, id)
-					delete(kills, id)
-				} else {
-					kills[id] = 0
+
+	if successRate >= 95.0 {
+		saveSystemState()
+		if rCount > minRadarEver {
+			sort.Slice(radarIDs, func(i, j int) bool {
+				return kills[radarIDs[i]] < kills[radarIDs[j]]
+			})
+			numToDrop := int(float64(rCount) * 0.10)
+			for i := 0; i < numToDrop; i++ {
+				if i >= len(radarIDs) || (len(entities)-len(cityNames)) <= MinRadars {
+					break
 				}
+				id := radarIDs[i]
+				delete(entities, id)
+				delete(kills, id)
+				budget += EfficiencyBonus
 			}
 		} else {
-			for id := range kills {
-				kills[id] = 0
+			minRadarEver = rCount
+			for _, id := range radarIDs {
+				if kills[id] == 0 {
+					delete(entities, id)
+					delete(kills, id)
+				}
 			}
 		}
-		if successRate >= 95.0 && rCount < minRadarEver {
-			minRadarEver = rCount
-			saveSystemState()
-		}
 	}
+	for id := range kills {
+		kills[id] = 0
+	}
+
 FinalizeReset:
 	currentCycle++
 	eraStartTime = simClock
@@ -224,10 +235,9 @@ func runPhysicsEngine() {
 				rCount++
 			}
 		}
-
 		if rCount < MinRadars {
 			for i := 0; i < (MinRadars - rCount); i++ {
-				id := fmt.Sprintf("R-REG-%d-%d", currentCycle, i)
+				id := fmt.Sprintf("R-REG-%d-%d", currentCycle, rand.Intn(100000))
 				lat, lon := getTetheredCoords()
 				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
 				budget -= EnforcementFee
@@ -235,8 +245,7 @@ func runPhysicsEngine() {
 			}
 		}
 
-		timeStep := 4 * time.Hour
-		simClock = simClock.Add(timeStep)
+		simClock = simClock.Add(4 * time.Hour)
 		totalThreats++
 		target := entities[cityNames[rand.Intn(len(cityNames))]]
 		intercepted := false
@@ -312,6 +321,7 @@ func main() {
 		brain = NewBrain(mutationRate)
 		forceReset = true
 		mu.Unlock()
+		w.Write([]byte("Panic Reset Executed"))
 	})
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
@@ -325,7 +335,7 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
-	fmt.Println("AEGIS TETHERED BOOT :8080")
+	fmt.Println("AEGIS PERSISTENT V11.4.42 RUNNING AT :8080")
 	http.ListenAndServe(":8080", nil)
 }
 
@@ -349,7 +359,7 @@ const uiHTML = `
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>body { margin:0; background:#000; color:#0f0; font-family:monospace; } #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af;} button { background:#f00; color:#fff; border:none; padding:5px; margin-top:5px; cursor:pointer;} #map { height:100vh; width:100vw; }</style></head>
-<body><div id="stats">ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>SUCCESS: <span id="success">0</span>% | MIN: <span id="minr">0</span><br><button onclick="fetch('/panic')">PANIC: RESET BRAIN</button></div><div id="map"></div>
+<body><div id="stats">ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>SUCCESS: <span id="success">0</span>% | BEST MIN: <span id="minr">0</span><br><button onclick="fetch('/panic')">PANIC: RESET BRAIN</button></div><div id="map"></div>
 <script>
     var map = L.map('map', {zoomControl:false}).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
@@ -358,7 +368,7 @@ const uiHTML = `
         const r = await fetch('/intel'); const d = await r.json();
         document.getElementById('era').innerText = d.cycle;
         document.getElementById('success').innerText = d.success.toFixed(1);
-        document.getElementById('minr').innerText = d.min_ever;
+        document.getElementById('minr').innerText = (d.min_ever == 500) ? "..." : d.min_ever;
         const ids = d.entities.map(e => e.id);
         Object.keys(layers).forEach(id => { if(!ids.includes(id)) { map.removeLayer(layers[id]); delete layers[id]; } });
         d.entities.forEach(e => {
