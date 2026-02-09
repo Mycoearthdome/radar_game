@@ -43,6 +43,7 @@ var (
 	mu               sync.RWMutex
 	eraStartTime     time.Time
 	simClock         time.Time
+	wallStart        time.Time // For Benchmark
 	currentCycle     = 1
 	brain            *Brain
 	successRate      float64
@@ -160,7 +161,6 @@ func autonomousEraReset() {
 	}
 
 	if totalEraSpending > BankruptcyLimit {
-		fmt.Println("[!] BANKRUPTCY: REBOOTING BRAIN")
 		brain = NewBrain(mutationRate)
 		for _, id := range radarIDs {
 			delete(entities, id)
@@ -222,6 +222,8 @@ func runPhysicsEngine() {
 			simClock = time.Now()
 			eraStartTime = time.Now()
 		}
+
+		// Check for Era Reset or Force Reset
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
@@ -229,56 +231,65 @@ func runPhysicsEngine() {
 			continue
 		}
 
+		// --- 1,000 THREAT BATCH ---
+		// This minimizes Mutex contention and maximizes i7 cache hits
+		const batchSize = 1000
+		for b := 0; b < batchSize; b++ {
+			totalThreats++
+			target := entities[cityNames[rand.Intn(len(cityNames))]]
+			intercepted := false
+
+			// Optimized distance checking
+			for id, e := range entities {
+				if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
+					kills[id]++
+					budget += InterceptReward
+					totalIntercepts++
+					intercepted = true
+					break
+				}
+			}
+			if !intercepted {
+				budget -= CityImpactPenalty
+			}
+
+			simClock = simClock.Add(4 * time.Hour)
+		}
+
+		// Re-calculate stats after the massive jump
+		successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 		rCount := 0
 		for _, e := range entities {
 			if e.Type == "RADAR" {
 				rCount++
 			}
 		}
+
+		// AI Placement Logic (once per 1k threats to keep logic/physics balanced)
 		if rCount < MinRadars {
 			for i := 0; i < (MinRadars - rCount); i++ {
-				id := fmt.Sprintf("R-REG-%d-%d", currentCycle, rand.Intn(100000))
+				id := fmt.Sprintf("R-REG-%d-%d", currentCycle, rand.Intn(1000000))
 				lat, lon := getTetheredCoords()
 				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
 				budget -= EnforcementFee
-				totalEraSpending += EnforcementFee
 			}
 		}
-
-		simClock = simClock.Add(4 * time.Hour)
-		totalThreats++
-		target := entities[cityNames[rand.Intn(len(cityNames))]]
-		intercepted := false
-		for id, e := range entities {
-			if e.Type == "RADAR" && getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
-				kills[id]++
-				budget += InterceptReward
-				totalIntercepts++
-				intercepted = true
-				break
-			}
-		}
-		if !intercepted {
-			budget -= CityImpactPenalty
-		}
-		successRate = (float64(totalIntercepts) / float64(totalThreats)) * 100
 
 		desperation := 0.0
 		if successRate < 90.0 {
 			desperation = (90.0 - successRate) / 100.0
 		}
 		input := []float64{math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)), float64(rCount) / 500.0, successRate / 100.0}
+
 		if (brain.Predict(input) == 1 || rand.Float64() < desperation) && budget >= RadarCost && rCount < MaxRadars {
-			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e6))
+			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
 			lat, lon := getTetheredCoords()
 			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
 			budget -= RadarCost
-			totalEraSpending += RadarCost
 		}
+
 		mu.Unlock()
-		if totalThreats%20 == 0 {
-			time.Sleep(1 * time.Microsecond)
-		}
+		// Let the CPU fly.
 	}
 }
 
@@ -314,6 +325,7 @@ func main() {
 		cityNames = append(cityNames, name)
 	}
 	setupSimulation()
+	wallStart = time.Now()
 	go runPhysicsEngine()
 
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
@@ -326,16 +338,27 @@ func main() {
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
+
+		elapsedWall := time.Since(wallStart).Seconds()
+		totalSimDays := float64(totalThreats) * 4.0 / 24.0
+		yearsPerSec := 0.0
+		if elapsedWall > 0 {
+			yearsPerSec = (totalSimDays / 365.0) / elapsedWall
+		}
+
 		var all []Entity
 		for _, e := range entities {
 			all = append(all, *e)
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{"cycle": currentCycle, "budget": budget, "entities": all, "success": successRate, "min_ever": minRadarEver})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"cycle": currentCycle, "budget": budget, "entities": all,
+			"success": successRate, "min_ever": minRadarEver, "yps": yearsPerSec,
+		})
 	})
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
-	fmt.Println("AEGIS PERSISTENT V11.4.42 RUNNING AT :8080")
+	fmt.Println("AEGIS BENCHMARK RUNNING AT :8080")
 	http.ListenAndServe(":8080", nil)
 }
 
@@ -355,11 +378,24 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS</title>
+<!DOCTYPE html><html><head><title>AEGIS i7 BENCHMARK</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<style>body { margin:0; background:#000; color:#0f0; font-family:monospace; } #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:10px; border:1px solid #0af;} button { background:#f00; color:#fff; border:none; padding:5px; margin-top:5px; cursor:pointer;} #map { height:100vh; width:100vw; }</style></head>
-<body><div id="stats">ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>SUCCESS: <span id="success">0</span>% | BEST MIN: <span id="minr">0</span><br><button onclick="fetch('/panic')">PANIC: RESET BRAIN</button></div><div id="map"></div>
+<style>
+    body { margin:0; background:#000; color:#0f0; font-family:monospace; } 
+    #stats { position:fixed; top:10px; left:10px; z-index:1000; background:rgba(0,10,20,0.9); padding:15px; border:1px solid #0af; box-shadow: 0 0 10px #0af;} 
+    button { background:#f00; color:#fff; border:none; padding:8px; margin-top:10px; cursor:pointer; width:100%; font-weight:bold;} 
+    #map { height:100vh; width:100vw; }
+    .benchmark { color: #ff0; font-weight: bold; }
+</style></head>
+<body>
+<div id="stats">
+    ERA: <span id="era">0</span> | RADARS: <span id="rcount">0</span><br>
+    SUCCESS: <span id="success">0</span>% | BEST MIN: <span id="minr">0</span><br>
+    SPEED: <span id="yps" class="benchmark">0.00</span> <span class="benchmark">Years/Sec</span>
+    <button onclick="fetch('/panic')">SCORCHED EARTH (RESET BRAIN)</button>
+</div>
+<div id="map"></div>
 <script>
     var map = L.map('map', {zoomControl:false}).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
@@ -369,6 +405,8 @@ const uiHTML = `
         document.getElementById('era').innerText = d.cycle;
         document.getElementById('success').innerText = d.success.toFixed(1);
         document.getElementById('minr').innerText = (d.min_ever == 500) ? "..." : d.min_ever;
+        document.getElementById('yps').innerText = d.yps.toFixed(2);
+        
         const ids = d.entities.map(e => e.id);
         Object.keys(layers).forEach(id => { if(!ids.includes(id)) { map.removeLayer(layers[id]); delete layers[id]; } });
         d.entities.forEach(e => {
