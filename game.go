@@ -247,7 +247,14 @@ func autonomousEraReset() {
 	}
 	rCount := len(radarIDs)
 
-	// 1. RECOVERY SEEDING
+	// 1. DETECT STAGNATION
+	if rCount < MinRadars && budget < RadarCost {
+		fmt.Println("STAGNATION DETECTED: Insufficient funds for recovery fleet. Auto-Resetting...")
+		budget = 500000.0 // Inject emergency capital
+		brain.Mutate(0.2) // Higher mutation to find a new path
+	}
+
+	// 2. RECOVERY SEEDING
 	if rCount < MinRadars || budget < 0 {
 		fmt.Printf("\n[!] RECOVERING: Seeding fleet...\n")
 		for i := 0; i < MinRadars; i++ {
@@ -694,29 +701,42 @@ const uiHTML = `
     .stat-line { font-size: 1.1em; margin-bottom: 5px; border-bottom: 1px solid #0af3; }
     .val { float: right; color: #fff; padding-left: 20px; }
     .highlight { color: #f0f; }
+    #panic-btn {
+        width: 100%; margin-top: 15px; padding: 10px;
+        background: #400; color: #f00; border: 1px solid #f00;
+        cursor: pointer; font-family: inherit; font-weight: bold;
+        transition: 0.3s;
+    }
+    #panic-btn:hover { background: #f00; color: #000; }
 </style></head>
 <body>
 <div id="stats">
-    <div class="stat-line">SYSTEM STATUS: <span class="val" style="color:#0f0">ACTIVE</span></div>
+    <div class="stat-line">SYSTEM STATUS: <span id="status" class="val" style="color:#0f0">ACTIVE</span></div>
     <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
     <div class="stat-line">FLEET: <span id="rcount" class="val">0</span> / <span id="maxr" class="highlight">0</span></div>
     <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
     <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
+    <button id="panic-btn" onclick="triggerPanic()">MANUAL SYSTEM RESET</button>
 </div>
 <div id="map"></div>
 <script>
-    // Enable Canvas rendering to handle high-frequency updates without DOM lag
-    var map = L.map('map', {
-        zoomControl:false, 
-        attributionControl:false,
-        preferCanvas: true 
-    }).setView([25, 10], 2);
-
+    var map = L.map('map', { zoomControl:false, attributionControl:false, preferCanvas: true }).setView([25, 10], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
     
     var layers = {};
     var isFetching = false;
+    var stallCount = 0; // Watchdog counter
+
+    async function triggerPanic() {
+        document.getElementById('status').innerText = "REBOOTING...";
+        document.getElementById('status').style.color = "#f00";
+        await fetch('/panic');
+        setTimeout(() => {
+            document.getElementById('status').innerText = "ACTIVE";
+            document.getElementById('status').style.color = "#0f0";
+        }, 1000);
+    }
 
     async function updateUI() {
         if (isFetching) return;
@@ -726,7 +746,18 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // Update Dashboards
+            // Watchdog Logic: If YPS is 0, increment stall count
+            if (data.yps <= 0) {
+                stallCount++;
+                if (stallCount > 40) { // Approx 6 seconds of 0 YPS at 150ms interval
+                    console.warn("Stall detected. Auto-resetting...");
+                    triggerPanic();
+                    stallCount = 0;
+                }
+            } else {
+                stallCount = 0;
+            }
+
             document.getElementById('era').innerText = data.cycle;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
@@ -739,23 +770,14 @@ const uiHTML = `
 
             (data.entities || []).forEach(e => {
                 currentIds.add(e.id);
-                
                 if (!layers[e.id]) {
-                    // Initialize New Entities
                     if (e.type === 'RADAR') {
-                        layers[e.id] = L.circle([e.lat, e.lon], {
-                            radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false
-                        }).addTo(map);
+                        layers[e.id] = L.circle([e.lat, e.lon], { radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false }).addTo(map);
                     } else {
-                        layers[e.id] = L.circleMarker([e.lat, e.lon], {
-                            radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false
-                        }).addTo(map);
+                        layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false }).addTo(map);
                     }
                 } else {
-                    // Real-Time Position Nudge
                     layers[e.id].setLatLng([e.lat, e.lon]);
-
-                    // Action Flash: If e.last_moved is recent, highlight the radar
                     if (e.last_moved && (now - e.last_moved < 1500)) {
                         layers[e.id].setStyle({color: '#ff0', weight: 4, fillOpacity: 0.5});
                     } else if (e.type === 'RADAR') {
@@ -764,19 +786,11 @@ const uiHTML = `
                 }
             });
 
-            // Cleanup Pruned Radars
             for (let id in layers) {
-                if (!currentIds.has(id)) {
-                    map.removeLayer(layers[id]);
-                    delete layers[id];
-                }
+                if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
-
         } catch (e) { console.error("Sync drop:", e); }
-        
         isFetching = false;
     }
-
-    // Use a high-frequency interval to capture AI "nudges" smoothly
     setInterval(updateUI, 150); 
 </script></body></html>`
