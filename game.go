@@ -603,7 +603,7 @@ func setupSimulation() {
 }
 
 const uiHTML = `
-<!DOCTYPE html><html><head><title>AEGIS AI OPTIMIZER</title>
+<!DOCTYPE html><html><head><title>AEGIS AI OPTIMIZER v2</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
@@ -611,95 +611,100 @@ const uiHTML = `
     #stats { 
         position:fixed; top:10px; left:10px; z-index:1000; 
         background:rgba(0,10,20,0.9); padding:15px; border:1px solid #0af; 
-        box-shadow: 0 0 10px #0af; line-height:1.5;
+        box-shadow: 0 0 10px #0af; line-height:1.6; min-width: 220px;
     } 
-    #map { height:100vh; width:100vw; }
+    #map { height:100vh; width:100vw; background: #000; }
+    .stat-row { display: flex; justify-content: space-between; border-bottom: 1px solid #0af3; }
     .stat-val { color: #fff; font-weight: bold; }
     .record-val { color: #f0f; font-weight: bold; }
+    .legend { font-size: 0.8em; margin-top: 10px; color: #aaa; }
 </style></head>
 <body>
 <div id="stats">
-    ERA: <span id="era" class="stat-val">0</span> | 
-    RADARS: <span id="rcount" class="stat-val">0</span> / <span id="maxr" class="record-val">0</span><br>
-    SUCCESS: <span id="success" class="stat-val">0</span>% | 
-    BEST: <span id="min_ever" class="record-val">0</span><br>
-    BUDGET: $<span id="budget" class="stat-val">0</span> | 
-    SPEED: <span id="yps" class="stat-val">0</span> Yrs/Sec
+    <div class="stat-row"><span>ERA:</span> <span id="era" class="stat-val">0</span></div>
+    <div class="stat-row"><span>RADARS:</span> <span><span id="rcount" class="stat-val">0</span> / <span id="maxr" class="record-val">0</span></span></div>
+    <div class="stat-row"><span>SUCCESS:</span> <span id="success" class="stat-val">0</span>%</div>
+    <div class="stat-row"><span>BEST:</span> <span id="min_ever" class="record-val">0</span></div>
+    <div class="stat-row"><span>BUDGET:</span> $<span id="budget" class="stat-val">0</span></div>
+    <div class="stat-row"><span>SPEED:</span> <span id="yps" class="stat-val">0</span> Y/sec</div>
+    <div class="legend">
+        <span style="color:#0f0">●</span> Coverage <span style="color:#f00">●</span> Target <span style="color:#ff0">●</span> Moving
+    </div>
 </div>
 <div id="map"></div>
 <script>
-    // Initialize map with dark theme
     var map = L.map('map', {zoomControl:false, attributionControl:false}).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
     
     var layers = {};
+    var isSyncing = false;
 
     async function sync() {
+        if (isSyncing) return;
+        isSyncing = true;
+
         try {
             const r = await fetch('/intel'); 
-            if (!r.ok) throw new Error('Network response was not ok');
+            if (!r.ok) throw new Error('Backend Starved');
             const d = await r.json();
 
-            // Update Text Stats
+            // 1. Update UI Elements
             document.getElementById('era').innerText = d.cycle;
-            document.getElementById('success').innerText = d.success.toFixed(1);
-            document.getElementById('budget').innerText = d.budget.toLocaleString();
+            document.getElementById('success').innerText = (d.success || 0).toFixed(1);
+            document.getElementById('budget').innerText = Math.floor(d.budget).toLocaleString();
             document.getElementById('min_ever').innerText = d.min_ever;
-            document.getElementById('yps').innerText = d.yps.toFixed(2);
+            document.getElementById('maxr').innerText = d.min_ever;
+            document.getElementById('yps').innerText = (d.yps || 0).toFixed(2);
 
             const entities = d.entities || [];
-            const currentIds = entities.map(e => e.id);
+            const currentIds = new Set(entities.map(e => e.id));
             const now = Date.now();
 
-            // Remove dead entities (pruned radars)
-            Object.keys(layers).forEach(id => {
-                if(!currentIds.includes(id)) {
+            // 2. Prune Dead Layers (Optimized)
+            for (let id in layers) {
+                if (!currentIds.has(id)) {
                     map.removeLayer(layers[id]);
                     delete layers[id];
                 }
-            });
+            }
             
             let radarCount = 0;
             entities.forEach(e => {
                 if (!layers[e.id]) {
+                    // Create New
                     if (e.type === 'RADAR') {
                         layers[e.id] = L.circle([e.lat, e.lon], {
-                            radius: 1200000, 
-                            color: '#0f0', 
-                            weight: 0.5, 
-                            fillOpacity: 0.1
+                            radius: 1200000, color: '#0f0', weight: 0.5, fillOpacity: 0.1
                         }).addTo(map);
                     } else {
                         layers[e.id] = L.circleMarker([e.lat, e.lon], {
-                            radius: 4, 
-                            color: '#f00',
-                            fillOpacity: 0.8
+                            radius: 3, color: '#f00', weight: 1, fillOpacity: 0.5
                         }).addTo(map);
                     }
                 } else {
-                    // Smooth position update
+                    // Update Existing (Throttled Move)
                     layers[e.id].setLatLng([e.lat, e.lon]);
                     
-                    // Relocation Flash Effect
-                    if (e.last_moved && (now - e.last_moved < 800)) {
-                        layers[e.id].setStyle({color: '#ff0', weight: 3, fillOpacity: 0.4});
-                        setTimeout(() => {
-                            if(layers[e.id]) layers[e.id].setStyle({color: '#0f0', weight: 0.5, fillOpacity: 0.1});
-                        }, 400);
+                    // Flash Logic for Relocation
+                    if (e.last_moved && (now - e.last_moved < 1200)) {
+                        layers[e.id].setStyle({color: '#ff0', weight: 3, fillOpacity: 0.5});
+                    } else if (e.type === 'RADAR') {
+                        layers[e.id].setStyle({color: '#0f0', weight: 0.5, fillOpacity: 0.1});
                     }
                 }
                 if (e.type === 'RADAR') radarCount++;
             });
 
             document.getElementById('rcount').innerText = radarCount;
-            // The limit scales down dynamically
-            document.getElementById('maxr').innerText = d.min_ever; 
 
         } catch (err) {
-            console.error("UI Sync Error:", err);
+            console.warn("Sync throttled:", err.message);
+        } finally {
+            isSyncing = false;
+            // Recursive timeout prevents request overlap
+            setTimeout(sync, 400); 
         }
     }
 
-    // High frequency sync for smooth "nudges" and relocation flashes
-    setInterval(sync, 1000);
+    sync(); // Boot up the loop
 </script></body></html>`
