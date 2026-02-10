@@ -74,7 +74,7 @@ var (
 	minEverRadars        = MaxRadars
 	forceReset           = false
 	cityNames            []string
-	mutationRate         = 0.01               //was 1.0
+	mutationRate         = 0.1                //was 1.0
 	quadrantMisses       = make([]float64, 4) // [NW, NE, SW, SE]
 	winStreakCounter     = 0
 	isSimulationOver     = false
@@ -244,14 +244,10 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 	// 5. Extract results from the 'out' node
 	res := b.out.Value().Data().([]float64)
 
-	// --- FIX B & C: SENSITIVITY OVERHAUL ---
-	// We lower the threshold from 0.4 to 0.22 to break the "Relocation Lockout".
-	// This makes the AI 45% more likely to take an action rather than "idling."
-
 	action := 0
-	if res[0] > 0.22 {
+	if res[0] > 0.1 {
 		action = 1 // BUILD: The AI identifies a gap and has the funds
-	} else if res[0] < -0.22 {
+	} else if res[0] < -0.1 {
 		action = 2 // RELOCATE: The AI identifies a failing radar in a safe zone
 	}
 
@@ -808,7 +804,7 @@ func runPhysicsEngine() {
 						lt++
 						// FIX: DYNAMIC PENALTY (Prevents the "Crisis Loop")
 						p := CityImpactPenalty
-						if snapSuccess < 85.0 {
+						if snapSuccess < 85.0 || rCount < MinRadars {
 							p *= 0.05
 						} // 95% discount while learning
 						lp += p
@@ -896,7 +892,8 @@ func runPhysicsEngine() {
 		action, latN, lonN := brain.PredictSpatial(input)
 		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
 
-		canAfford := budget >= RelocationCost || successRate < 90.0
+		// FORCE MOVE FIX: Bypass budget if success is low
+		canAffordRelocation := budget >= RelocationCost || successRate < 90.0
 
 		if action == 1 && rCount < MaxRadars {
 			tQ := 0
@@ -914,11 +911,12 @@ func runPhysicsEngine() {
 			if budget >= RadarCost {
 				budget -= RadarCost
 			}
-		} else if action == 2 && canAfford {
+
+		} else if action == 2 && canAffordRelocation {
 			var worstID string
 			minK := 999999
 
-			// 1. Identify the most "Useless" Radar (Candidate for relocation)
+			// 1. Identify the most "Useless" Radar
 			for id, c := range kills {
 				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
 					minK = c
@@ -927,7 +925,7 @@ func runPhysicsEngine() {
 			}
 
 			if e, ok := entities[worstID]; ok {
-				// 2. Identify the "Crisis Zone" (Quadrant with highest misses)
+				// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
 				targetQ := 0
 				maxMiss := -1.0
 				for i, m := range quadrantMisses {
@@ -937,21 +935,22 @@ func runPhysicsEngine() {
 					}
 				}
 
-				// 3. FORCE LEAP: Move to the targeted quadrant city tether
-				// We use the latN/lonN from the brain as a 'precision nudge' within that quadrant
+				// 3. TARGETED LEAP: Get a base position in that specific quadrant
+				// Instead of e.Lat = e.Lat + nudge, we do:
 				bLat, bLon := getTargetedTether(targetQ)
 
-				e.Lat = bLat + (latN * prec)
-				e.Lon = bLon + (lonN * prec)
-				e.LastMoved = time.Now().UnixMilli() // Triggers the yellow pulse in your UI
+				// 4. APPLY POSITION: Leap to the city, then use NN nudge for local offset
+				// precision here should be around 50-100km to spread them out around the city
+				e.Lat = bLat + (latN * 50.0 / 111.0) // 111km per degree approx
+				e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
 
-				// 4. Reset stats so the NN can re-evaluate this radar's new performance
-				kills[worstID] = 0
+				e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
+				kills[worstID] = 0                   // Reset performance for the new era
 
-				// Only charge the budget if we aren't in a learning crisis
-				if successRate >= 90.0 {
+				if budget >= RelocationCost {
 					budget -= RelocationCost
 				}
+				fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
 			}
 		}
 		mu.Unlock()
