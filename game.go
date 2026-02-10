@@ -70,7 +70,7 @@ var (
 	lastEraSuccess       float64
 	totalThreats         int
 	totalIntercepts      int
-	MaxRadars            = 500
+	MaxRadars            = 250
 	minEverRadars        = MaxRadars
 	forceReset           = false
 	cityNames            []string
@@ -109,13 +109,18 @@ type Entity struct {
 }
 
 type Brain struct {
-	g      *gorgonia.ExprGraph
-	w0     *gorgonia.Node
-	w1     *gorgonia.Node
-	x      *gorgonia.Node
-	out    *gorgonia.Node
+	g   *gorgonia.ExprGraph
+	w0  *gorgonia.Node
+	w1  *gorgonia.Node
+	x   *gorgonia.Node
+	out *gorgonia.Node
+
+	target *gorgonia.Node
+	actual *gorgonia.Node
+	cost   *gorgonia.Node
+
 	vm     gorgonia.VM
-	solver gorgonia.Solver // Interface type
+	solver gorgonia.Solver
 }
 
 func (b *Brain) Mutate(rate float64) {
@@ -184,16 +189,26 @@ func getGridID(lat, lon float64) int {
 
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
-	x := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 16), gorgonia.WithName("x"))
+	x := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 18), gorgonia.WithName("x"))
 
-	// Weights initialized with multiplier (difficulty)
-	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(16, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(18, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(24, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 
+	// Forward Pass
 	h0 := gorgonia.Must(gorgonia.Mul(x, w0))
 	a0 := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.1))
 	h1 := gorgonia.Must(gorgonia.Mul(a0, w1))
 	out := gorgonia.Must(gorgonia.Tanh(h1))
+
+	// --- TARGET NODE ---
+	// Instead of 'actual', we define a 'target_signal' node.
+	// If the simulation was successful, we nudge 'out' toward 1.0 (Stay/Build).
+	// If it failed, we nudge it toward -1.0 (Move).
+	targetSignal := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 3), gorgonia.WithName("target_signal"))
+
+	// --- THE DIFFERENTIABLE COST ---
+	// This connects 'out' (and thus w0/w1) to the error calculation.
+	cost := gorgonia.Must(gorgonia.Mean(gorgonia.Must(gorgonia.Square(gorgonia.Must(gorgonia.Sub(targetSignal, out))))))
 
 	solver := gorgonia.NewVanillaSolver(gorgonia.WithLearnRate(0.01), gorgonia.WithClip(5.0))
 
@@ -203,12 +218,41 @@ func NewBrain(multiplier float64) *Brain {
 		w1:     w1,
 		x:      x,
 		out:    out,
+		target: targetSignal, // We'll bind the 'ideal' action here
+		cost:   cost,
 		solver: solver,
 	}
 }
 
+func (b *Brain) Train(inputs []float64, idealAction []float64) {
+	// 1. Bind the state the radar was in
+	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
+	gorgonia.Let(b.x, inputT)
+
+	// 2. Bind the "Ideal" outcome (e.g., [1, 0, 0] for 'Stay' if it intercepted)
+	targetT := tensor.New(tensor.WithShape(1, 3), tensor.WithBacking(idealAction))
+	gorgonia.Let(b.target, targetT)
+
+	if b.vm == nil {
+		b.vm = gorgonia.NewTapeMachine(b.g, gorgonia.BindDualValues(b.w0, b.w1))
+	}
+
+	if err := b.vm.RunAll(); err != nil {
+		return
+	}
+	defer b.vm.Reset()
+
+	// 3. This will now work because 'cost' is linked to 'w0' and 'w1' via 'out'
+	if _, err := gorgonia.Grad(b.cost, b.w0, b.w1); err != nil {
+		return
+	}
+
+	targets := []gorgonia.ValueGrad{b.w0, b.w1}
+	b.solver.Step(targets)
+}
+
 func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
-	if len(inputs) != 16 || b.g == nil {
+	if len(inputs) != 18 || b.g == nil {
 		return 0, 0, 0
 	}
 
@@ -218,7 +262,7 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 	}
 
 	// Bind inputs safely
-	inputT := tensor.New(tensor.WithShape(1, 16), tensor.WithBacking(inputs))
+	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
 	if err := gorgonia.Let(b.x, inputT); err != nil {
 		return 0, 0, 0
 	}
@@ -245,6 +289,48 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 		action = 2
 	}
 	return action, res[1], res[2]
+}
+
+// getBrainInputs generates the 16-variable state representation for the NN.
+// It matches the input structure used in runPhysicsEngine.
+func getBrainInputs(e *Entity, rCount int, snapBudget float64, snapSuccess float64, quadrantRadars []float64, satCount int, dayProgress float64) []float64 {
+
+	// Normalization Helpers
+	normBudget := math.Max(-1, math.Min(snapBudget/1e9, 1.0))
+	normSuccess := snapSuccess / 100.0
+	normDelta := (successRate - lastEraSuccess) / 100.0
+	normDiff := difficultyMultiplier / 10.0 // Was unused
+
+	// Time context (Cyclical)
+	sinTime := math.Sin(2 * math.Pi * dayProgress)
+	cosTime := math.Cos(2 * math.Pi * dayProgress) // Was unused
+
+	return []float64{
+		e.Lat / 90.0,                         // 0
+		e.Lon / 180.0,                        // 1
+		normBudget,                           // 2
+		float64(rCount) / float64(MaxRadars), // 3
+		normSuccess,                          // 4
+
+		// QUADRANT MISSES
+		math.Min(quadrantMisses[0]/100.0, 1.0), // 5
+		math.Min(quadrantMisses[1]/100.0, 1.0), // 6
+		math.Min(quadrantMisses[2]/100.0, 1.0), // 7
+		math.Min(quadrantMisses[3]/100.0, 1.0), // 8
+
+		float64(satCount) / float64(MaxSatellites), // 9
+
+		// QUADRANT RADAR DENSITY
+		math.Min(quadrantRadars[0]/20.0, 1.0), // 10
+		math.Min(quadrantRadars[1]/20.0, 1.0), // 11
+		math.Min(quadrantRadars[2]/20.0, 1.0), // 12
+		math.Min(quadrantRadars[3]/20.0, 1.0), // 13
+
+		normDelta, // 14
+		normDiff,  // 15: Added normDiff to use it
+		sinTime,   // 16: Note - If your Brain shape is (1, 16),
+		cosTime,
+	}
 }
 
 func loadSystemState() {
@@ -352,7 +438,43 @@ func saveSystemState() {
 	}
 }
 
-func autonomousEraReset() {
+func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty float64) {
+	// --- 1. MOVE AGGREGATION TO THE TOP ---
+	radarIDs := []string{}
+	quadrantRadars := make([]float64, 4)
+	satCount := 0
+	for id, e := range entities {
+		if e.Type == "RADAR" {
+			radarIDs = append(radarIDs, id)
+			idx := 0
+			if e.Lat < 0 {
+				idx += 2
+			}
+			if e.Lon > 0 {
+				idx += 1
+			}
+			quadrantRadars[idx]++
+		} else if e.Type == "SAT" {
+			satCount++
+		}
+	}
+	rCount := len(radarIDs)
+	dayProgress := 1.0 // End of era
+
+	// --- 2. NOW TRAIN THE BRAIN ---
+	for _, id := range radarIDs {
+		e := entities[id]
+		// Now rCount, quadrantRadars, etc. are properly defined and in scope
+		inputs := getBrainInputs(e, rCount, snapBudget, snapSuccess, quadrantRadars, satCount, dayProgress)
+
+		var idealAction []float64
+		if kills[id] > 0 {
+			idealAction = []float64{1.0, 0.0, 0.0} // Stay
+		} else {
+			idealAction = []float64{-1.0, 0.0, 0.0} // Move
+		}
+		brain.Train(inputs, idealAction)
+	}
 
 	// 1. EVALUATE PERFORMANCE & BONUSES
 	// Reward scaling based on efficiency tiers
@@ -396,14 +518,6 @@ func autonomousEraReset() {
 	}
 
 	// 3. TARGET SCALING (Fleet Tightening)
-	radarIDs := []string{}
-	for id, e := range entities {
-		if e.Type == "RADAR" {
-			radarIDs = append(radarIDs, id)
-		}
-	}
-	rCount := len(radarIDs)
-
 	if successRate >= 99.5 && (totalThreats+totalIntercepts) >= 50 {
 		if rCount < minEverRadars {
 			minEverRadars = rCount
@@ -646,7 +760,7 @@ func runPhysicsEngine() {
 	for {
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
-			autonomousEraReset()
+			autonomousEraReset(budget, successRate, difficultyMultiplier)
 			continue
 		}
 
@@ -700,7 +814,6 @@ func runPhysicsEngine() {
 				cityIndex[gID] = append(cityIndex[gID], id)
 			}
 		}
-		snapBudget, snapSuccess := budget, successRate
 
 		// Worker Pool
 		var wg sync.WaitGroup
@@ -770,7 +883,7 @@ func runPhysicsEngine() {
 						lt++
 						// FIX: DYNAMIC PENALTY (Prevents the "Crisis Loop")
 						p := CityImpactPenalty
-						if snapSuccess < 85.0 || rCount < MinRadars {
+						if successRate < 85.0 || rCount < MinRadars {
 							p *= 0.05
 						} // 95% discount while learning
 						lp += p
@@ -819,46 +932,13 @@ func runPhysicsEngine() {
 		// NN Prediction & Actions
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
 
-		// Normalization Helpers
-		normBudget := math.Max(-1, math.Min(snapBudget/1e9, 1.0))
-		normSuccess := snapSuccess / 100.0
-		normDelta := (successRate - lastEraSuccess) / 100.0
-		normDiff := difficultyMultiplier / 10.0
-
-		// Time context (Cyclical)
-		sinTime := math.Sin(2 * math.Pi * dayProgress)
-		cosTime := math.Cos(2 * math.Pi * dayProgress)
-
-		input := []float64{
-			normBudget,                           // 0: Financial health
-			float64(rCount) / float64(MaxRadars), // 1: Fleet density
-			normSuccess,                          // 2: Overall efficiency
-
-			// QUADRANT MISSES (Sensitivity: 100.0 makes failures "louder" than 500.0)
-			math.Min(quadrantMisses[0]/100.0, 1.0), // 3: NW Misses
-			math.Min(quadrantMisses[1]/100.0, 1.0), // 4: NE Misses
-			math.Min(quadrantMisses[2]/100.0, 1.0), // 5: SW Misses
-			math.Min(quadrantMisses[3]/100.0, 1.0), // 6: SE Misses
-
-			float64(satCount) / float64(MaxSatellites), // 7: Orbital coverage
-
-			// QUADRANT RADAR DENSITY
-			math.Min(quadrantRadars[0]/20.0, 1.0), // 8: NW Count
-			math.Min(quadrantRadars[1]/20.0, 1.0), // 9: NE Count
-			math.Min(quadrantRadars[2]/20.0, 1.0), // 10: SW Count
-			math.Min(quadrantRadars[3]/20.0, 1.0), // 11: SE Count
-
-			normDelta, // 12: Trend (improving/worsening)
-			normDiff,  // 13: Pressure level
-			sinTime,   // 14: Day Cycle Sin
-			cosTime,   // 15: Day Cycle Cos
-		}
+		input := getBrainInputs(nil, rCount, budget, successRate, quadrantRadars, satCount, dayProgress)
 
 		action, latN, lonN := brain.PredictSpatial(input)
 
-		// --- KICKSTART LOGIC ---
+		// --- KICKSTART LOGIC ---CHEAT
 		// If we haven't moved in 100 eras and success is low, force an action
-		if successRate < 95.0 && rand.Float64() < 0.05 {
+		if successRate <= 50.0 && rand.Float64() < 0.05 {
 			if rCount < MaxRadars {
 				action = 1 // Force Build
 			} else {
@@ -922,6 +1002,8 @@ func runPhysicsEngine() {
 
 				e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
 				kills[worstID] = 0                   // Reset performance for the new era
+
+				e.LastMoved = time.Now().UnixMilli()
 
 				if budget >= RelocationCost {
 					budget -= RelocationCost
@@ -1108,6 +1190,7 @@ func main() {
 			"yps":           yps,
 			"max_radars":    MaxRadars,
 			"mutation_rate": mutationRate,
+			"server_time":   time.Now().UnixMilli(),
 		})
 	})
 
@@ -1124,58 +1207,60 @@ const uiHTML = `
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-    body { margin:0; background:#001; color:#0f0; font-family:'Courier New', monospace; overflow:hidden; } 
+    body { margin:0; background:#000810; color:#0f0; font-family:'Segoe UI', 'Courier New', monospace; overflow:hidden; } 
     #stats { 
         position:fixed; top:15px; left:15px; z-index:1000; 
-        background:rgba(0,15,30,0.95); padding:20px; border:2px solid #0af; 
-        box-shadow: 0 0 20px #0af; border-radius: 4px; width: 280px;
+        background:rgba(0,10,20,0.9); padding:20px; border:1px solid #0af; 
+        box-shadow: 0 0 15px rgba(0,170,255,0.3); border-radius: 8px; width: 300px;
+        backdrop-filter: blur(5px);
     } 
     #map { height:100vh; width:100vw; background: #000; }
-    .stat-line { font-size: 1.1em; margin-bottom: 5px; border-bottom: 1px solid #0af3; }
-    .val { float: right; color: #fff; padding-left: 20px; }
-    .highlight { color: #f0f; }
+    .stat-line { font-size: 0.95em; margin-bottom: 8px; display: flex; justify-content: space-between; border-bottom: 1px solid #0af2; padding-bottom: 4px; }
+    .val { color: #fff; font-weight: bold; }
     .intel-box { 
-        margin-top: 10px; padding: 10px; border: 1px solid #ff0; 
-        background: rgba(255, 255, 0, 0.05); text-align: center;
+        margin-top: 15px; padding: 12px; border: 1px solid #fb0; 
+        background: rgba(251, 176, 0, 0.1); text-align: center; border-radius: 4px;
     }
-    #intensity { font-weight: bold; font-size: 1.2em; display: block; }
-    #lr-val { font-size: 0.8em; color: #aaa; }
+    #intensity { font-weight: bold; font-size: 1.1em; display: block; letter-spacing: 1px; }
+    #lr-val { font-size: 0.8em; color: #aaa; margin-top: 5px; display: block; }
     #panic-btn {
         width: 100%; margin-top: 15px; padding: 10px;
-        background: #400; color: #f00; border: 1px solid #f00;
+        background: rgba(100,0,0,0.4); color: #f44; border: 1px solid #f44;
         cursor: pointer; font-family: inherit; font-weight: bold;
-        transition: 0.3s;
+        transition: 0.2s; border-radius: 4px;
     }
-    #panic-btn:hover { background: #f00; color: #000; }
+    #panic-btn:hover { background: #f44; color: #000; box-shadow: 0 0 10px #f44; }
 </style></head>
 <body>
 <div id="stats">
-    <div class="stat-line">SYSTEM STATUS: <span id="status" class="val" style="color:#0f0">ACTIVE</span></div>
-    <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
-    <div class="stat-line">FLEET: <span id="rcount" class="val">0</span></div>
-    <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
-    <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
-    <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
+    <div style="font-size:1.2em; font-weight:bold; color:#0af; margin-bottom:15px; border-bottom:2px solid #0af;">AEGIS CONTROL STRATUM</div>
+    <div class="stat-line">SYSTEM STATUS <span id="status" class="val" style="color:#0f0">OPERATIONAL</span></div>
+    <div class="stat-line">ERA <span id="era" class="val">0</span></div>
+    <div class="stat-line">FLEET SIZE <span id="rcount" class="val">0</span> / <span id="max_radars">0</span></div>
+    <div class="stat-line">EFFICIENCY <span id="success" class="val">0.00</span>%</div>
+    <div class="stat-line">THROUGHPUT <span id="yps" class="val">0</span> Y/sec</div>
+    <div class="stat-line">BUDGET <span id="budget" class="val" style="color:#fb0">$0</span></div>
     
     <div class="intel-box">
         <span id="intensity">ANALYZING...</span>
-        <span id="lr-val">LR: 0.00000</span>
+        <span id="lr-val">MUTATION: 0.00000</span>
     </div>
 
-    <button id="panic-btn" onclick="triggerPanic()">MANUAL SYSTEM RESET</button>
+    <button id="panic-btn" onclick="triggerPanic()">INITIATE SYSTEM PURGE</button>
 </div>
 <div id="map"></div>
 <script>
-    var map = L.map('map', { zoomControl:false, attributionControl:false, preferCanvas: true }).setView([25, 10], 2);
+    var map = L.map('map', { zoomControl:false, attributionControl:false, preferCanvas: true }).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
     
     var layers = {};
     var isFetching = false;
 
     async function triggerPanic() {
-        document.getElementById('status').innerText = "REBOOTING...";
-        document.getElementById('status').style.color = "#f00";
-        try { await fetch('/panic'); } catch (e) { console.error("Reset failed:", e); }
+        if(!confirm("ARE YOU SURE? THIS WIPES THE NEURAL NETWORK WEIGHTS.")) return;
+        document.getElementById('status').innerText = "PURGING...";
+        document.getElementById('status').style.color = "#f44";
+        try { await fetch('/panic'); } catch (e) { console.error(e); }
     }
 
     async function updateUI() {
@@ -1186,33 +1271,36 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // 1. Sync Standard Stats
+            // 1. Sync Dashboard
             document.getElementById('era').innerText = data.cycle;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
             document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
+            document.getElementById('max_radars').innerText = data.max_radars || 60;
             
-            // 2. Intelligence & Training UI Logic
-            const yps = data.yps || 0;
             const success = data.success || 0;
-            const lr = data.mutation_rate || 0;
+            const mutRate = data.mutation_rate || 0;
             const intensityEl = document.getElementById('intensity');
             
-            document.getElementById('lr-val').innerText = "MUTATION RATE: " + lr.toFixed(5);
+            document.getElementById('lr-val').innerText = "MUTATION RATE: " + mutRate.toFixed(5);
 
-            if (success < 75) {
-                intensityEl.innerText = yps > 5 ? "HYPER-LEARNING" : "CRISIS RECOVERY";
+            // Dynamic Status Coloring
+            if (success < 80) {
+                intensityEl.innerText = "CRISIS RECOVERY";
                 intensityEl.style.color = "#f44";
-            } else if (success < 95) {
-                intensityEl.innerText = "OPTIMIZING";
+                document.getElementById('status').style.color = "#fb0";
+            } else if (success < 99) {
+                intensityEl.innerText = "ACTIVE OPTIMIZATION";
                 intensityEl.style.color = "#fb0";
+                document.getElementById('status').style.color = "#0f0";
             } else {
-                intensityEl.innerText = "FINE-TUNING";
+                intensityEl.innerText = "STEADY STATE";
                 intensityEl.style.color = "#0af";
             }
 
-            // 3. Entity Rendering
-            const now = Date.now();
+            // 2. Rendering Logic with Server-Time Sync
+            // Use the server's own clock if provided, otherwise fallback to local
+            const now = data.server_time || Date.now(); 
             const currentIds = new Set();
             let radarCount = 0;
 
@@ -1221,6 +1309,7 @@ const uiHTML = `
                 if (e.type === 'RADAR') radarCount++;
 
                 if (!layers[e.id]) {
+                    // Initial Creation
                     if (e.type === 'RADAR') {
                         layers[e.id] = L.circle([e.lat, e.lon], { radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1 }).addTo(map);
                     } else if (e.type === 'SAT') {
@@ -1229,25 +1318,34 @@ const uiHTML = `
                         layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7 }).addTo(map);
                     }
                 } else {
+                    // Update Position
                     layers[e.id].setLatLng([e.lat, e.lon]);
-                    const movedRecently = e.last_moved && (now - e.last_moved < 1500);
+                    
+                    // RELOCATION PULSE: Highlight yellow if LastMoved happened in last 2 seconds
+                    const movedRecently = e.last_moved && (now - e.last_moved < 2000);
+                    
                     if (movedRecently) {
-                        layers[e.id].setStyle({ color: '#ff0', weight: 6, fillOpacity: 0.4 });
+                        layers[e.id].setStyle({ color: '#ff0', weight: 5, fillOpacity: 0.5, radius: 1500000 });
                     } else {
-                        if (e.type === 'RADAR') layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
-                        else if (e.type === 'SAT') layers[e.id].setStyle({color: '#0af', weight: 1, fillOpacity: 0.05});
+                        // Reset to standard style
+                        if (e.type === 'RADAR') {
+                            layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1, radius: 1200000});
+                        } else if (e.type === 'SAT') {
+                            layers[e.id].setStyle({color: '#0af', weight: 1, fillOpacity: 0.05});
+                        }
                     }
                 }
             });
 
             document.getElementById('rcount').innerText = radarCount;
 
+            // Cleanup destroyed entities (missiles that hit/intercepted)
             for (let id in layers) {
                 if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
-        } catch (e) { console.error("UI Sync drop:", e); }
+        } catch (e) { console.error("UI Data Sync Failure:", e); }
         isFetching = false;
     }
     
-    setInterval(updateUI, 150);
+    setInterval(updateUI, 100); // 10Hz Refresh rate
 </script></body></html>`
