@@ -32,10 +32,10 @@ const (
 	TimeStepping        = 20 * time.Minute
 	RadarFile           = "RADAR.json"
 	BrainFile           = "BRAIN.gob"
-	BankruptcyLimit     = 0.0
-	GridSize            = 10 // 10 degree cells
-	Cols                = 36 // 360 / 10
-	Rows                = 18 // 180 / 10
+	BankruptcyLimit     = StartBudget / 2 //50%
+	GridSize            = 10              // 10 degree cells
+	Cols                = 36              // 360 / 10
+	Rows                = 18              // 180 / 10
 	TargetSuccess       = 100.0
 	RequiredWinStreak   = 5000   // Number of eras to maintain 100% before "winning"
 	MissileMaxSpeedKMH  = 8000.0 // Hypersonic Mach 6.5+
@@ -51,7 +51,7 @@ const (
 	LaunchInterval      = 1 * 24 * 31 * time.Hour //one month
 	MissileMaxRangeKM   = 2500.0                  // The absolute maximum distance a missile can travel
 	FuelConsumption     = 0.04                    // Energy/Fuel cost per KM traveled by the threat
-	StartBudget         = 10000000000000.0
+	StartBudget         = 500000000000.0
 	EmergencyBudget     = StartBudget / 2
 )
 
@@ -67,6 +67,7 @@ var (
 	currentCycle         = 1
 	brain                *Brain
 	successRate          float64
+	lastEraSuccess       float64
 	totalThreats         int
 	totalIntercepts      int
 	MaxRadars            = 500
@@ -108,11 +109,11 @@ type Entity struct {
 }
 
 type Brain struct {
-	g      *gorgonia.ExprGraph
-	w0, w1 *gorgonia.Node
-	x      *gorgonia.Node
-	out    *gorgonia.Node
-	vm     gorgonia.VM
+	g   *gorgonia.ExprGraph
+	w0  *gorgonia.Node
+	w1  *gorgonia.Node
+	x   *gorgonia.Node // The input placeholder
+	out *gorgonia.Node // The output (Tanh) node
 }
 
 func (b *Brain) Mutate(rate float64) {
@@ -150,6 +151,7 @@ func (b *Brain) AdaptiveMutate(success float64) {
 	if rate < 0.002 {
 		rate = 0.002
 	}
+	mutationRate = rate
 
 	fmt.Printf("[Mutation] Success: %.2f%% | Applying Jitter Rate: %.5f\n", success, rate)
 
@@ -181,84 +183,85 @@ func getGridID(lat, lon float64) int {
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
 
-	// 12 Inputs: [0:Budget, 1:Radars, 2:Success, 3-6:Misses, 7:SatCount, 8-11:RadarDensity]
-	inputSize := 12
-	hiddenSize := 16
-	outputSize := 3 // Simplified to exact needs: [Action, LatNudge, LonNudge]
+	// Define the Input Placeholder (This is what was nil)
+	x := gorgonia.NewMatrix(g, tensor.Float64,
+		gorgonia.WithShape(1, 16),
+		gorgonia.WithName("x"))
 
-	// Define Weights with specific initializers
+	// Define Weights
 	w0 := gorgonia.NewMatrix(g, tensor.Float64,
-		gorgonia.WithShape(inputSize, hiddenSize),
+		gorgonia.WithShape(16, 24),
 		gorgonia.WithName("w0"),
 		gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 
 	w1 := gorgonia.NewMatrix(g, tensor.Float64,
-		gorgonia.WithShape(hiddenSize, outputSize),
+		gorgonia.WithShape(24, 3),
 		gorgonia.WithName("w1"),
 		gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 
-	// We no longer define 'x' and 'out' here if we want a dynamic TapeMachine,
-	// but keeping them as pointers in the struct is fine for reference.
+	// --- Define the Graph Path ---
+	// Layer 1
+	h0 := gorgonia.Must(gorgonia.Mul(x, w0))
+	a0 := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.1))
+
+	// Layer 2 (Output)
+	h1 := gorgonia.Must(gorgonia.Mul(a0, w1))
+	out := gorgonia.Must(gorgonia.Tanh(h1))
+
 	return &Brain{
-		g:  g,
-		w0: w0,
-		w1: w1,
+		g:   g,
+		w0:  w0,
+		w1:  w1,
+		x:   x,   // Store the reference for Let()
+		out: out, // Store the reference for reading results
 	}
 }
 
 func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
-	// Create input tensor for this specific prediction
-	inputT := tensor.New(tensor.WithShape(12), tensor.WithBacking(inputs))
-	x := gorgonia.NodeFromAny(b.g, inputT, gorgonia.WithName("x_input"))
-
-	// --- Forward Pass ---
-	// Layer 0: Input * W0
-	h0 := gorgonia.Must(gorgonia.Mul(x, b.w0))
-
-	// FIX: Use LeakyRectify instead of Rectify to prevent Dead Neurons
-	// This keeps the gradient flowing even for negative inputs.
-	activated := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.01))
-
-	// Layer 1: Hidden * W1 -> Tanh for action/spatial nudges
-	out := gorgonia.Must(gorgonia.Mul(activated, b.w1))
-	out = gorgonia.Must(gorgonia.Tanh(out))
-
-	// --- Execution ---
-	vm := gorgonia.NewTapeMachine(b.g)
-	if err := vm.RunAll(); err != nil {
-		vm.Close()
+	// 1. Safety Check: Ensure the input vector matches our new 16-node architecture
+	if len(inputs) != 16 {
+		fmt.Printf("[ERROR] Expected 16 inputs, got %d\n", len(inputs))
 		return 0, 0, 0
 	}
 
-	res := out.Value().Data().([]float64)
-	vm.Close() // CRUCIAL: Prevent memory leaks
+	// 2. Create input tensor
+	// We use a 1x16 shape to match our Matrix multiplication requirements (1x16 * 16x24)
+	inputT := tensor.New(tensor.WithShape(1, 16), tensor.WithBacking(inputs))
 
-	// --- Action Logic ---
-	action := 0
-	// Tanh outputs are -1 to 1.
-	// > 0.33 -> BUILD | < -0.33 -> RELOCATE | Else -> STAY
-	if res[0] > 0.33 {
-		action = 1
-	} else if res[0] < -0.33 {
-		action = 2
+	// 3. Bind the tensor to the graph's input node
+	// Note: 'b.x' must be defined in your Brain struct as the input placeholder node
+	err := gorgonia.Let(b.x, inputT)
+	if err != nil {
+		return 0, 0, 0
 	}
 
-	// res[1] and res[2] are used for latNudge and lonNudge
-	return action, res[1], res[2]
-}
+	// 4. Execution using TapeMachine
+	// We use a persistent VM if possible, or create a light one for this pass
+	vm := gorgonia.NewTapeMachine(b.g)
+	defer vm.Close() // Ensures no memory leaks during high-speed eras
 
-func (b *Brain) Predict(input []float64) int {
-	gorgonia.Let(b.x, tensor.New(tensor.WithBacking(input)))
-	b.vm.RunAll()
+	if err := vm.RunAll(); err != nil {
+		return 0, 0, 0
+	}
+
+	// 5. Extract results from the 'out' node
+	// 'b.out' is the final Tanh node in your graph
 	res := b.out.Value().Data().([]float64)
-	b.vm.Reset()
-	maxIdx := 0
-	for i, v := range res {
-		if v > res[maxIdx] {
-			maxIdx = i
-		}
+
+	// 6. Strategic Action Mapping
+	// res[0] is the Action Selector (Tanh: -1 to 1)
+	action := 0
+	if res[0] > 0.4 {
+		action = 1 // BUILD: Decisive positive signal
+	} else if res[0] < -0.4 {
+		action = 2 // RELOCATE: Decisive negative signal
 	}
-	return maxIdx
+	// Middle ground (-0.4 to 0.4) is STAY/OBSERVE
+
+	// 7. Return results
+	// res[1] = Latitudinal Nudge
+	// res[2] = Longitudinal Nudge
+	return action, res[1], res[2]
 }
 
 func loadSystemState() {
@@ -497,6 +500,8 @@ func autonomousEraReset() {
 		brain.AdaptiveMutate(successRate)
 		budget = EmergencyBudget // Emergency Capital Injection
 	}
+
+	lastEraSuccess = successRate
 
 	// 6. FINALIZE ERA & CLOCK SNAP
 	for id := range kills {
@@ -751,7 +756,7 @@ func runPhysicsEngine() {
 		// 4. MULTI-THREADED THREAT SIMULATION
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
-		batchSize := 100000 // Increased per your "winning too easily" feedback
+		batchSize := 100
 
 		for w := 0; w < numWorkers; w++ {
 			wg.Add(1)
@@ -872,19 +877,39 @@ func runPhysicsEngine() {
 			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
 
+		// 1. Calculate Spatial Density (Current distribution of assets)
+		// quadrantRadars is already calculated in Section 3 of your loop
+
+		// 2. Temporal Awareness: Mapping the 24h cycle to a unit circle
+		// This helps the NN learn the "rhythm" of your satellite orbits
+		elapsed := simClock.Sub(eraStartTime).Seconds()
+		dayProgress := elapsed / EraDuration.Seconds()
+		timeSin := math.Sin(2 * math.Pi * dayProgress)
+		timeCos := math.Cos(2 * math.Pi * dayProgress)
+
+		// 3. Efficiency Trend (Is defense improving or failing?)
+		// Note: lastEraSuccess is updated in autonomousEraReset
+		trend := (successRate - lastEraSuccess) / 100.0
+
+		// 4. Construct the 16-Node Input Vector
+		// We normalize all values between -1.0 and 1.0 to keep the Brain stable
 		input := []float64{
-			math.Max(-1, math.Min(budget/1000000000.0, 1.0)),
-			float64(rCount) / float64(MaxRadars),
-			successRate / 100.0,
-			math.Min(quadrantMisses[0]/50, 1.0),
-			math.Min(quadrantMisses[1]/50, 1.0),
-			math.Min(quadrantMisses[2]/50, 1.0),
-			math.Min(quadrantMisses[3]/50, 1.0),
-			float64(satCount) / float64(MaxSatellites),
-			math.Min(quadrantRadars[0]/20, 1.0),
-			math.Min(quadrantRadars[1]/20, 1.0),
-			math.Min(quadrantRadars[2]/20, 1.0),
-			math.Min(quadrantRadars[3]/20, 1.0),
+			math.Max(-1, math.Min(budget/1e9, 1.0)),    // 0: Budget (Normalized to Billions)
+			float64(rCount) / float64(MaxRadars),       // 1: Radar Fleet Load
+			successRate / 100.0,                        // 2: Efficiency (0.0 to 1.0)
+			math.Min(quadrantMisses[0]/500.0, 1.0),     // 3: Q1 Weighted Misses
+			math.Min(quadrantMisses[1]/500.0, 1.0),     // 4: Q2
+			math.Min(quadrantMisses[2]/500.0, 1.0),     // 5: Q3
+			math.Min(quadrantMisses[3]/500.0, 1.0),     // 6: Q4
+			float64(satCount) / float64(MaxSatellites), // 7: Satellite Fleet Load
+			math.Min(quadrantRadars[0]/20.0, 1.0),      // 8: Q1 Radar Density
+			math.Min(quadrantRadars[1]/20.0, 1.0),      // 9: Q2
+			math.Min(quadrantRadars[2]/20.0, 1.0),      // 10: Q3
+			math.Min(quadrantRadars[3]/20.0, 1.0),      // 11: Q4
+			math.Max(-1.0, math.Min(trend, 1.0)),       // 12: Success Trend
+			difficultyMultiplier / 10.0,                // 13: Relative Threat Speed
+			timeSin,                                    // 14: Temporal Pulse (Sin)
+			timeCos,                                    // 15: Temporal Pulse (Cos)
 		}
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
@@ -1117,14 +1142,15 @@ func main() {
 
 		// UPDATED: Added max_radars for the UI dashboard
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cycle":      currentCycle,
-			"budget":     budget,
-			"entities":   all,
-			"success":    successRate,
-			"streak":     winStreakCounter,
-			"isOver":     isSimulationOver,
-			"yps":        yps,
-			"max_radars": MaxRadars,
+			"cycle":         currentCycle,
+			"budget":        budget,
+			"entities":      all,
+			"success":       successRate,
+			"streak":        winStreakCounter,
+			"isOver":        isSimulationOver,
+			"yps":           yps,
+			"max_radars":    MaxRadars,
+			"mutation_rate": mutationRate,
 		})
 	})
 
@@ -1132,7 +1158,7 @@ func main() {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
 
-	fmt.Println("AEGIS BENCHMARK RUNNING AT :8080")
+	fmt.Println("AEGIS RUNNING AT :8080")
 	http.ListenAndServe(":8080", nil)
 }
 
@@ -1151,6 +1177,12 @@ const uiHTML = `
     .stat-line { font-size: 1.1em; margin-bottom: 5px; border-bottom: 1px solid #0af3; }
     .val { float: right; color: #fff; padding-left: 20px; }
     .highlight { color: #f0f; }
+    .intel-box { 
+        margin-top: 10px; padding: 10px; border: 1px solid #ff0; 
+        background: rgba(255, 255, 0, 0.05); text-align: center;
+    }
+    #intensity { font-weight: bold; font-size: 1.2em; display: block; }
+    #lr-val { font-size: 0.8em; color: #aaa; }
     #panic-btn {
         width: 100%; margin-top: 15px; padding: 10px;
         background: #400; color: #f00; border: 1px solid #f00;
@@ -1163,11 +1195,16 @@ const uiHTML = `
 <div id="stats">
     <div class="stat-line">SYSTEM STATUS: <span id="status" class="val" style="color:#0f0">ACTIVE</span></div>
     <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
-    <div class="stat-line">FLEET: <span id="rcount" class="val">0</span> / <span id="maxr" class="highlight">0</span></div>
+    <div class="stat-line">FLEET: <span id="rcount" class="val">0</span></div>
     <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
-    <div class="stat-line">WIN STREAK: <span id="streak" class="val highlight">0 / 5000</span></div>
     <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
+    
+    <div class="intel-box">
+        <span id="intensity">ANALYZING...</span>
+        <span id="lr-val">LR: 0.00000</span>
+    </div>
+
     <button id="panic-btn" onclick="triggerPanic()">MANUAL SYSTEM RESET</button>
 </div>
 <div id="map"></div>
@@ -1177,18 +1214,11 @@ const uiHTML = `
     
     var layers = {};
     var isFetching = false;
-    var stallCount = 0;
 
     async function triggerPanic() {
         document.getElementById('status').innerText = "REBOOTING...";
         document.getElementById('status').style.color = "#f00";
-        try {
-            await fetch('/panic');
-            setTimeout(() => {
-                document.getElementById('status').innerText = "ACTIVE";
-                document.getElementById('status').style.color = "#0f0";
-            }, 1000);
-        } catch (e) { console.error("Reset failed:", e); }
+        try { await fetch('/panic'); } catch (e) { console.error("Reset failed:", e); }
     }
 
     async function updateUI() {
@@ -1199,37 +1229,36 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // 1. Handle Final Win Condition
-            if (data.isOver) {
-                document.getElementById('status').innerText = "MISSION COMPLETE";
-                document.getElementById('status').style.color = "#f0f";
-                document.getElementById('streak').innerText = "CONVERGED";
-                isFetching = false;
-                return; 
-            }
-
-            // 2. Watchdog: Auto-reset if YPS stalls at 0
-            if (data.yps <= 0 && data.cycle > 1) {
-                stallCount++;
-                if (stallCount > 40) { 
-                    console.warn("Stall detected. Triggering recovery...");
-                    triggerPanic();
-                    stallCount = 0;
-                }
-            } else { stallCount = 0; }
-
-            // 3. Sync Stats
+            // 1. Sync Standard Stats
             document.getElementById('era').innerText = data.cycle;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
             document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
-            document.getElementById('streak').innerText = (data.streak || 0) + " / 5000";
+            
+            // 2. Intelligence & Training UI Logic
+            const yps = data.yps || 0;
+            const success = data.success || 0;
+            const lr = data.mutation_rate || 0;
+            const intensityEl = document.getElementById('intensity');
+            
+            document.getElementById('lr-val').innerText = "MUTATION RATE: " + lr.toFixed(5);
 
+            if (success < 75) {
+                intensityEl.innerText = yps > 5 ? "HYPER-LEARNING" : "CRISIS RECOVERY";
+                intensityEl.style.color = "#f44";
+            } else if (success < 95) {
+                intensityEl.innerText = "OPTIMIZING";
+                intensityEl.style.color = "#fb0";
+            } else {
+                intensityEl.innerText = "FINE-TUNING";
+                intensityEl.style.color = "#0af";
+            }
+
+            // 3. Entity Rendering
             const now = Date.now();
             const currentIds = new Set();
             let radarCount = 0;
 
-            // 4. Update Entities
             (data.entities || []).forEach(e => {
                 currentIds.add(e.id);
                 if (e.type === 'RADAR') radarCount++;
@@ -1243,34 +1272,19 @@ const uiHTML = `
                         layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7 }).addTo(map);
                     }
                 } else {
-                    // Update position
                     layers[e.id].setLatLng([e.lat, e.lon]);
-
-                    // MOVEMENT VISUAL FEEDBACK
-                    // If moved in last 1.5 seconds, flash yellow to show NN activity
                     const movedRecently = e.last_moved && (now - e.last_moved < 1500);
-                    
                     if (movedRecently) {
-                        layers[e.id].setStyle({
-                            color: '#ff0', 
-                            weight: 6, // Thicker border
-                            fillOpacity: 0.4,
-                            dashArray: null // Solid line during move
-                        });
+                        layers[e.id].setStyle({ color: '#ff0', weight: 6, fillOpacity: 0.4 });
                     } else {
-                        // Revert to standard styling
-                        if (e.type === 'RADAR') {
-                            layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
-                        } else if (e.type === 'SAT') {
-                            layers[e.id].setStyle({color: '#0af', weight: 1, fillOpacity: 0.05, dashArray: '5, 10'});
-                        }
+                        if (e.type === 'RADAR') layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
+                        else if (e.type === 'SAT') layers[e.id].setStyle({color: '#0af', weight: 1, fillOpacity: 0.05});
                     }
                 }
             });
 
             document.getElementById('rcount').innerText = radarCount;
 
-            // 5. Cleanup Dead Entities
             for (let id in layers) {
                 if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
