@@ -857,14 +857,40 @@ func runPhysicsEngine() {
 
 		// NN Prediction & Actions
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
+
+		// Normalization Helpers
+		normBudget := math.Max(-1, math.Min(snapBudget/1e9, 1.0))
+		normSuccess := snapSuccess / 100.0
+		normDelta := (successRate - lastEraSuccess) / 100.0
+		normDiff := difficultyMultiplier / 10.0
+
+		// Time context (Cyclical)
+		sinTime := math.Sin(2 * math.Pi * dayProgress)
+		cosTime := math.Cos(2 * math.Pi * dayProgress)
+
 		input := []float64{
-			math.Max(-1, math.Min(snapBudget/1e9, 1.0)), float64(rCount) / float64(MaxRadars),
-			snapSuccess / 100.0, math.Min(quadrantMisses[0]/500.0, 1.0), math.Min(quadrantMisses[1]/500.0, 1.0),
-			math.Min(quadrantMisses[2]/500.0, 1.0), math.Min(quadrantMisses[3]/500.0, 1.0),
-			float64(satCount) / float64(MaxSatellites), math.Min(quadrantRadars[0]/20.0, 1.0),
-			math.Min(quadrantRadars[1]/20.0, 1.0), math.Min(quadrantRadars[2]/20.0, 1.0),
-			math.Min(quadrantRadars[3]/20.0, 1.0), (successRate - lastEraSuccess) / 100.0,
-			difficultyMultiplier / 10.0, math.Sin(2 * math.Pi * dayProgress), math.Cos(2 * math.Pi * dayProgress),
+			normBudget,                           // 0: Financial health
+			float64(rCount) / float64(MaxRadars), // 1: Fleet density
+			normSuccess,                          // 2: Overall efficiency
+
+			// QUADRANT MISSES (Sensitivity: 100.0 makes failures "louder" than 500.0)
+			math.Min(quadrantMisses[0]/100.0, 1.0), // 3: NW Misses
+			math.Min(quadrantMisses[1]/100.0, 1.0), // 4: NE Misses
+			math.Min(quadrantMisses[2]/100.0, 1.0), // 5: SW Misses
+			math.Min(quadrantMisses[3]/100.0, 1.0), // 6: SE Misses
+
+			float64(satCount) / float64(MaxSatellites), // 7: Orbital coverage
+
+			// QUADRANT RADAR DENSITY
+			math.Min(quadrantRadars[0]/20.0, 1.0), // 8: NW Count
+			math.Min(quadrantRadars[1]/20.0, 1.0), // 9: NE Count
+			math.Min(quadrantRadars[2]/20.0, 1.0), // 10: SW Count
+			math.Min(quadrantRadars[3]/20.0, 1.0), // 11: SE Count
+
+			normDelta, // 12: Trend (improving/worsening)
+			normDiff,  // 13: Pressure level
+			sinTime,   // 14: Day Cycle Sin
+			cosTime,   // 15: Day Cycle Cos
 		}
 
 		action, latN, lonN := brain.PredictSpatial(input)
@@ -891,7 +917,8 @@ func runPhysicsEngine() {
 		} else if action == 2 && canAfford {
 			var worstID string
 			minK := 999999
-			// Find the radar with the fewest kills in the LAST era
+
+			// 1. Identify the most "Useless" Radar (Candidate for relocation)
 			for id, c := range kills {
 				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
 					minK = c
@@ -900,7 +927,7 @@ func runPhysicsEngine() {
 			}
 
 			if e, ok := entities[worstID]; ok {
-				// Find the quadrant with the MOST misses to move the radar TO
+				// 2. Identify the "Crisis Zone" (Quadrant with highest misses)
 				targetQ := 0
 				maxMiss := -1.0
 				for i, m := range quadrantMisses {
@@ -910,12 +937,21 @@ func runPhysicsEngine() {
 					}
 				}
 
-				// Move the useless radar to the crisis zone
+				// 3. FORCE LEAP: Move to the targeted quadrant city tether
+				// We use the latN/lonN from the brain as a 'precision nudge' within that quadrant
 				bLat, bLon := getTargetedTether(targetQ)
+
 				e.Lat = bLat + (latN * prec)
 				e.Lon = bLon + (lonN * prec)
-				e.LastMoved = time.Now().UnixMilli()
-				kills[worstID] = 0 // Reset stats for the new location
+				e.LastMoved = time.Now().UnixMilli() // Triggers the yellow pulse in your UI
+
+				// 4. Reset stats so the NN can re-evaluate this radar's new performance
+				kills[worstID] = 0
+
+				// Only charge the budget if we aren't in a learning crisis
+				if successRate >= 90.0 {
+					budget -= RelocationCost
+				}
 			}
 		}
 		mu.Unlock()
