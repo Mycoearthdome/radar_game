@@ -756,7 +756,7 @@ func runPhysicsEngine() {
 		// 4. MULTI-THREADED THREAT SIMULATION
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
-		batchSize := 100
+		batchSize := 16
 
 		for w := 0; w < numWorkers; w++ {
 			wg.Add(1)
