@@ -19,40 +19,41 @@ import (
 )
 
 const (
-	RadarRadiusKM       = 1200.0
-	TetherRadiusKM      = 800.0
-	RadarCost           = 250000.0
-	RelocationCost      = 5000.0
-	EnforcementFee      = 5000000.0
-	MinRadars           = 60
-	CityImpactPenalty   = 200000.0
-	InterceptReward     = 10000.0
-	EarthRadius         = 6371.0
-	EraDuration         = 24 * time.Hour
-	TimeStepping        = 20 * time.Minute
-	RadarFile           = "RADAR.json"
-	BrainFile           = "BRAIN.gob"
-	BankruptcyLimit     = 0.0
-	GridSize            = 10 // 10 degree cells
-	Cols                = 36 // 360 / 10
-	Rows                = 18 // 180 / 10
-	TargetSuccess       = 100.0
-	RequiredWinStreak   = 5000   // Number of eras to maintain 100% before "winning"
-	MissileMaxSpeedKMH  = 8000.0 // Hypersonic Mach 6.5+
-	MissileGMLimit      = 40.0   // Max turning force
-	ProximityRadiusKM   = 5.0    // Blast zone
-	KineticRadiusKM     = 0.1    // Direct hit
-	BaseKillProbability = 0.85   // Success rate for proximity detonation
-	MaxEnergy           = 100.0  // Starting energy percentage
-	DragPenaltyBase     = 0.05   // Energy loss per KM of flight
-	ManeuverEnergyCost  = 2.5    // Extra cost for high-G turns
-	MaxSatellites       = 20
-	SatelliteRangeKM    = 2500.0                  // Higher vantage point = wider reach
-	LaunchInterval      = 1 * 24 * 31 * time.Hour //one month
-	MissileMaxRangeKM   = 2500.0                  // The absolute maximum distance a missile can travel
-	FuelConsumption     = 0.04                    // Energy/Fuel cost per KM traveled by the threat
-	StartBudget         = 1000000000.0
-	EmergencyBudget     = StartBudget
+	RadarRadiusKM           = 1200.0
+	TetherRadiusKM          = 800.0
+	RadarCost               = 250000.0
+	RelocationCost          = 5000.0
+	EnforcementFee          = 5000000.0
+	MinRadars               = 120
+	CityImpactPenalty       = 200000.0
+	InterceptReward         = 10000.0
+	EarthRadius             = 6371.0
+	EraDuration             = 24 * time.Hour
+	TimeStepping            = 4 * time.Hour
+	RadarFile               = "RADAR.json"
+	BrainFile               = "BRAIN.gob"
+	BankruptcyLimit         = 0.0
+	GridSize                = 10 // 10 degree cells
+	Cols                    = 36 // 360 / 10
+	Rows                    = 18 // 180 / 10
+	TargetSuccess           = 100.0
+	RequiredWinStreak       = 500    // Number of eras to maintain 100% before "winning"
+	MissileMaxSpeedKMH      = 8000.0 // Hypersonic Mach 6.5+
+	MissileGMLimit          = 40.0   // Max turning force
+	ProximityRadiusKM       = 5.0    // Blast zone
+	KineticRadiusKM         = 0.1    // Direct hit
+	BaseKillProbability     = 0.85   // Success rate for proximity detonation
+	MaxEnergy               = 100.0  // Starting energy percentage
+	DragPenaltyBase         = 0.05   // Energy loss per KM of flight
+	ManeuverEnergyCost      = 2.5    // Extra cost for high-G turns
+	MaxSatellites           = 20
+	SatelliteRangeKM        = 2500.0                  // Higher vantage point = wider reach
+	LaunchInterval          = 1 * 24 * 31 * time.Hour //one month
+	MissileMaxRangeKM       = 2500.0                  // The absolute maximum distance a missile can travel
+	FuelConsumption         = 0.04                    // Energy/Fuel cost per KM traveled by the threat
+	StartBudget             = 1000000000.0
+	EmergencyBudget         = StartBudget
+	MissilesBatchedInFlight = 1000
 )
 
 var (
@@ -70,7 +71,7 @@ var (
 	lastEraSuccess       float64
 	totalThreats         int
 	totalIntercepts      int
-	MaxRadars            = 250
+	MaxRadars            = 500
 	minEverRadars        = MaxRadars
 	forceReset           = false
 	cityNames            []string
@@ -160,7 +161,7 @@ func (b *Brain) AdaptiveMutate(success float64) {
 	}
 	mutationRate = rate
 
-	fmt.Printf("[Mutation] Success: %.2f%% | Applying Jitter Rate: %.5f\n", success, rate)
+	//fmt.Printf("[Mutation] Success: %.2f%% | Applying Jitter Rate: %.5f\n", success, rate)
 
 	// 2. Access the Raw Data of the weights
 	// We mutate both the input-to-hidden (w0) and hidden-to-output (w1) layers.
@@ -351,7 +352,7 @@ func loadSystemState() {
 	if data, err := os.ReadFile(RadarFile); err == nil {
 		var savedEntities []Entity
 		if err := json.Unmarshal(data, &savedEntities); err == nil {
-			mu.Lock()
+			mu.RLock()
 			// Reset entities to clear any seeded data from main()
 			entities = make(map[string]*Entity)
 
@@ -378,7 +379,7 @@ func loadSystemState() {
 					kills[e.ID] = 0
 				}
 			}
-			mu.Unlock()
+			mu.RUnlock()
 			fmt.Printf("Successfully loaded %d entities from persistence.\n", len(savedEntities))
 		}
 	}
@@ -457,6 +458,7 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 	radarIDs := []string{}
 	quadrantRadars := make([]float64, 4)
 	satCount := 0
+	mu.RLock()
 	for id, e := range entities {
 		if e.Type == "RADAR" {
 			radarIDs = append(radarIDs, id)
@@ -472,6 +474,7 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 			satCount++
 		}
 	}
+	mu.RUnlock()
 	rCount := len(radarIDs)
 	dayProgress := 1.0 // End of era
 
@@ -482,11 +485,13 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 		inputs := getBrainInputs(e, rCount, snapBudget, snapSuccess, quadrantRadars, satCount, dayProgress)
 
 		var idealAction []float64
+		mu.RLock()
 		if kills[id] > 0 {
 			idealAction = []float64{1.0, 0.0, 0.0} // Stay
 		} else {
 			idealAction = []float64{-1.0, 0.0, 0.0} // Move
 		}
+		mu.RUnlock()
 		brain.Train(inputs, idealAction)
 	}
 
@@ -504,33 +509,6 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 		EfficiencyBonus = 100000.0 // Reset to baseline on failure
 	}
 
-	// 2. WIN STREAK & CONVERGENCE
-	// Ensure a minimum threat volume before counting a 'Win' to prevent cheesing
-	if successRate >= 100.0 && (totalThreats+totalIntercepts) > 50 {
-		winStreakCounter++
-		fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
-
-		if winStreakCounter >= RequiredWinStreak {
-			fmt.Println("\n==================================================")
-			fmt.Println("CONVERGENCE REACHED: AEGIS SHIELD IS OPTIMIZED")
-			fmt.Printf("Final Fleet Size: %d | Total Eras: %d\n", len(entities)-len(cityNames), currentCycle)
-			fmt.Println("==================================================")
-
-			isSimulationOver = true
-			saveSystemState()
-			go func() {
-				time.Sleep(2 * time.Second)
-				os.Exit(0)
-			}()
-			return
-		}
-	} else {
-		if winStreakCounter > 0 {
-			fmt.Printf("\n[!] STREAK BROKEN: Efficiency fell to %.2f%%\n", successRate)
-		}
-		winStreakCounter = 0
-	}
-
 	// 3. TARGET SCALING (Fleet Tightening)
 	if successRate >= 99.5 && (totalThreats+totalIntercepts) >= 50 {
 		if rCount < minEverRadars {
@@ -543,10 +521,12 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 
 	// 4. AGGRESSIVE PRUNING WITH NEWBORN PROTECTION
 	if successRate >= 95.0 {
+		mu.RLock()
 		// Sort by kills (Ascending)
 		sort.Slice(radarIDs, func(i, j int) bool {
 			return kills[radarIDs[i]] < kills[radarIDs[j]]
 		})
+		mu.RUnlock()
 
 		numToDrop := int(float64(rCount) * 0.15)
 		dropped := 0
@@ -560,11 +540,12 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 			if dropped >= numToDrop || (len(radarIDs)-dropped) <= MinRadars {
 				break
 			}
-
+			mu.RLock()
 			e, exists := entities[id]
 			if !exists {
 				continue
 			}
+			mu.RUnlock()
 
 			// --- THE FIX: NEWBORN GRACE PERIOD ---
 			// If the radar is younger than 6 hours, skip it.
@@ -573,9 +554,11 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 				continue
 			}
 
+			mu.Lock()
 			// If it's old enough and still has 0 or low kills, prune it
 			delete(entities, id)
 			delete(kills, id)
+			mu.Unlock()
 			dropped++
 
 			// Refund/Efficiency Reward logic
@@ -651,9 +634,10 @@ func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 }
 
 func getTetheredCoords() (float64, float64) {
+	mu.RLock()
 	// Pick a random city to anchor the new radar
 	city := entities[cityNames[rand.Intn(len(cityNames))]]
-
+	mu.RUnlock()
 	// Random offset within the tether radius (~7-8 degrees is roughly 800km)
 	lat := city.Lat + (rand.Float64()-0.5)*14.0
 	lon := city.Lon + (rand.Float64()-0.5)*14.0
@@ -765,11 +749,12 @@ func getTargetedTether(quadrant int) (float64, float64) {
 
 func runPhysicsEngine() {
 	var lastLaunch time.Time
-
+	mu.Lock()
 	if simClock.IsZero() {
 		simClock = time.Now()
 		eraStartTime = simClock
 	}
+	mu.Unlock()
 
 	for {
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
@@ -780,22 +765,29 @@ func runPhysicsEngine() {
 
 		// Update Satellites
 		satCount := 0
+		mu.RLock()
 		for _, e := range entities {
 			if e.Type == "SAT" {
 				satCount++
 			}
 		}
+		mu.RUnlock()
+
 		if satCount < MaxSatellites && simClock.Sub(lastLaunch) >= LaunchInterval {
 			site := launchSites[rand.Intn(len(launchSites))]
 			id := fmt.Sprintf("SAT-%d-%d", currentCycle, satCount)
+			mu.Lock()
 			entities[id] = &Entity{ID: id, Type: "SAT", LaunchLat: site.Lat, LaunchLon: site.Lon, Lat: site.Lat, Lon: site.Lon, StartTime: simClock.Unix()}
+			mu.Unlock()
 			lastLaunch = simClock
 		}
+		mu.RLock()
 		for _, e := range entities {
 			if e.Type == "SAT" {
 				e.Lat, e.Lon = getSatellitePos(e.StartTime, e.LaunchLat, e.LaunchLon, simClock)
 			}
 		}
+		mu.RUnlock()
 
 		// Snapshot for Lock-Free Simulation
 		type EntityVal struct {
@@ -807,7 +799,7 @@ func runPhysicsEngine() {
 		cityIndex := make(map[int][]string)
 		quadrantRadars := make([]float64, 4)
 		rCount := 0
-
+		mu.Lock()
 		for id, e := range entities {
 			snap[id] = EntityVal{ID: e.ID, Type: e.Type, Lat: e.Lat, Lon: e.Lon}
 			gID := getGridID(e.Lat, e.Lon)
@@ -828,11 +820,11 @@ func runPhysicsEngine() {
 				cityIndex[gID] = append(cityIndex[gID], id)
 			}
 		}
-
+		mu.Unlock()
 		// Worker Pool
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
-		batchSize := numWorkers
+		batchSize := MissilesBatchedInFlight
 		workerKills := make(chan map[string]int, numWorkers)
 		workerStats := make(chan struct {
 			ints, thrs int
@@ -921,7 +913,7 @@ func runPhysicsEngine() {
 		}
 
 		go func() { wg.Wait(); close(workerKills); close(workerStats) }()
-
+		mu.Lock()
 		for lk := range workerKills {
 			for id, count := range lk {
 				if _, ok := kills[id]; ok {
@@ -929,6 +921,8 @@ func runPhysicsEngine() {
 				}
 			}
 		}
+		mu.Unlock()
+
 		for ls := range workerStats {
 			totalIntercepts += ls.ints
 			totalThreats += ls.thrs
@@ -939,13 +933,60 @@ func runPhysicsEngine() {
 		}
 
 		simClock = simClock.Add(TimeStepping)
+
+		// Adjust learning rate: The better we do, the less we "mutate"
+		currentLR := 0.01
+		if successRate >= 99.0 {
+			currentLR = 0.001 // Reduce by 10x for stability
+		}
+		if successRate >= 99.9 {
+			currentLR = 0.0001 // Lock in the "best placement"
+		}
+
+		// Apply the new rate to the solver
+		brain.solver = gorgonia.NewVanillaSolver(
+			gorgonia.WithLearnRate(currentLR),
+			gorgonia.WithClip(5.0),
+		)
+
+		// 2. WIN STREAK & CONVERGENCE
+		// Ensure a minimum threat volume before counting a 'Win' to prevent cheesing
+		if successRate >= 100.0 && (totalThreats+totalIntercepts) > 50 {
+			winStreakCounter++
+			fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
+
+			if winStreakCounter >= RequiredWinStreak {
+				fmt.Println("\n==================================================")
+				fmt.Println("CONVERGENCE REACHED: AEGIS SHIELD IS OPTIMIZED")
+				mu.RLock()
+				fmt.Printf("Final Fleet Size: %d | Total Eras: %d\n", len(entities)-len(cityNames), currentCycle)
+				mu.RUnlock()
+				fmt.Println("==================================================")
+
+				isSimulationOver = true
+				saveSystemState()
+				go func() {
+					time.Sleep(2 * time.Second)
+					os.Exit(0)
+				}()
+				return
+			}
+		} else {
+			if winStreakCounter > 0 {
+				fmt.Printf("\n[!] STREAK BROKEN: Efficiency fell to %.2f%%\n", successRate)
+			}
+			winStreakCounter = 0
+		}
+
 		if totalThreats+totalIntercepts > 0 {
 			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
 
 		// NN Prediction & Actions
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
+		mu.RLock()
 		entities_clone := entities
+		mu.RUnlock()
 		for _, e := range entities_clone {
 			if e.Type != "RADAR" {
 				continue
@@ -983,8 +1024,12 @@ func runPhysicsEngine() {
 				}
 				bLat, bLon := getTargetedTether(tQ)
 				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
+				entities_clone[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
+
+				mu.Lock()
 				kills[id] = 0
+				mu.Unlock()
+
 				if budget >= RadarCost {
 					budget -= RadarCost
 				}
@@ -993,15 +1038,17 @@ func runPhysicsEngine() {
 				var worstID string
 				minK := 999999
 
+				mu.RLock()
 				// 1. Identify the most "Useless" Radar
 				for id, c := range kills {
-					if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
+					if e, ok := entities_clone[id]; ok && e.Type == "RADAR" && c < minK {
 						minK = c
 						worstID = id
 					}
 				}
+				mu.RUnlock()
 
-				if e, ok := entities[worstID]; ok {
+				if e, ok := entities_clone[worstID]; ok {
 					// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
 					targetQ := 0
 					maxMiss := -1.0
@@ -1022,20 +1069,23 @@ func runPhysicsEngine() {
 					e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
 
 					e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
-					kills[worstID] = 0                   // Reset performance for the new era
+
+					mu.RLock()
+					kills[worstID] = 0 // Reset performance for the new era
+					mu.RUnlock()
 
 					e.LastMoved = time.Now().UnixMilli()
 
 					if budget >= RelocationCost {
 						budget -= RelocationCost
 					}
-					fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
+					//fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
 				}
 			}
 		}
 		simClock = simClock.Add(TimeStepping)
-		//runtime.Gosched()                // CRITICAL: Gives the web server/UI a window to get the lock
-		time.Sleep(10 * time.Millisecond) // Prevents 100% CPU lock
+		runtime.Gosched()                 // CRITICAL: Gives the web server/UI a window to get the lock
+		time.Sleep(20 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
 
@@ -1165,10 +1215,10 @@ func main() {
 	// 5. HTTP HANDLERS
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		defer mu.Unlock()
 		entities = make(map[string]*Entity)
 		cityNames = []string{}
 		kills = make(map[string]int)
+		mu.Unlock()
 		for name, pos := range cityData {
 			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
 			cityNames = append(cityNames, name)
