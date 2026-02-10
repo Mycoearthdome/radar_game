@@ -1238,9 +1238,6 @@ func main() {
 	})
 
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-
 		// Calculate Years Per Second
 		realSeconds := time.Since(wallStart).Seconds()
 		simHours := simClock.Sub(eraStartTime).Hours() + (float64(currentCycle-1) * EraDuration.Hours())
@@ -1250,11 +1247,12 @@ func main() {
 		if realSeconds > 0 {
 			yps = simYears / realSeconds
 		}
-
+		mu.Lock()
 		var all []Entity
 		for _, e := range entities {
 			all = append(all, *e)
 		}
+		mu.Unlock()
 
 		// UPDATED: Added max_radars for the UI dashboard
 		json.NewEncoder(w).Encode(map[string]interface{}{
