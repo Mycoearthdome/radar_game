@@ -1084,10 +1084,11 @@ func runPhysicsEngine() {
 			}
 		}
 		simClock = simClock.Add(TimeStepping)
-		runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
 		mu.Lock()
 		kills = kills_clone
+		entities = entities_clone
 		mu.Unlock()
+		runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
 		//time.Sleep(20 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
