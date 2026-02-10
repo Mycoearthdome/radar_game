@@ -109,11 +109,13 @@ type Entity struct {
 }
 
 type Brain struct {
-	g   *gorgonia.ExprGraph
-	w0  *gorgonia.Node
-	w1  *gorgonia.Node
-	x   *gorgonia.Node // The input placeholder
-	out *gorgonia.Node // The output (Tanh) node
+	g      *gorgonia.ExprGraph
+	w0     *gorgonia.Node
+	w1     *gorgonia.Node
+	x      *gorgonia.Node
+	out    *gorgonia.Node
+	vm     gorgonia.VM
+	solver gorgonia.Solver // Interface type
 }
 
 func (b *Brain) Mutate(rate float64) {
@@ -182,78 +184,66 @@ func getGridID(lat, lon float64) int {
 
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
+	x := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 16), gorgonia.WithName("x"))
 
-	// Define the Input Placeholder (This is what was nil)
-	x := gorgonia.NewMatrix(g, tensor.Float64,
-		gorgonia.WithShape(1, 16),
-		gorgonia.WithName("x"))
+	// Weights initialized with multiplier (difficulty)
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(16, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(24, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 
-	// Define Weights
-	w0 := gorgonia.NewMatrix(g, tensor.Float64,
-		gorgonia.WithShape(16, 24),
-		gorgonia.WithName("w0"),
-		gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-
-	w1 := gorgonia.NewMatrix(g, tensor.Float64,
-		gorgonia.WithShape(24, 3),
-		gorgonia.WithName("w1"),
-		gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-
-	// --- Define the Graph Path ---
-	// Layer 1
 	h0 := gorgonia.Must(gorgonia.Mul(x, w0))
 	a0 := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.1))
-
-	// Layer 2 (Output)
 	h1 := gorgonia.Must(gorgonia.Mul(a0, w1))
 	out := gorgonia.Must(gorgonia.Tanh(h1))
 
+	solver := gorgonia.NewVanillaSolver(gorgonia.WithLearnRate(0.01), gorgonia.WithClip(5.0))
+
 	return &Brain{
-		g:   g,
-		w0:  w0,
-		w1:  w1,
-		x:   x,   // Store the reference for Let()
-		out: out, // Store the reference for reading results
+		g:      g,
+		w0:     w0,
+		w1:     w1,
+		x:      x,
+		out:    out,
+		solver: solver,
 	}
 }
 
 func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
-	// 1. Safety Check: Ensure the input vector matches the 16-node architecture
-	if len(inputs) != 16 {
-		fmt.Printf("[ERROR] Expected 16 inputs, got %d\n", len(inputs))
+	if len(inputs) != 16 || b.g == nil {
 		return 0, 0, 0
 	}
 
-	// 2. Create input tensor
+	// Lazy init the VM if it doesn't exist
+	if b.vm == nil {
+		b.vm = gorgonia.NewTapeMachine(b.g, gorgonia.BindDualValues(b.w0, b.w1))
+	}
+
+	// Bind inputs safely
 	inputT := tensor.New(tensor.WithShape(1, 16), tensor.WithBacking(inputs))
-
-	// 3. Bind the tensor to the graph's input node
-	err := gorgonia.Let(b.x, inputT)
-	if err != nil {
+	if err := gorgonia.Let(b.x, inputT); err != nil {
 		return 0, 0, 0
 	}
 
-	// 4. Execution using TapeMachine
-	vm := gorgonia.NewTapeMachine(b.g)
-	defer vm.Close()
-
-	if err := vm.RunAll(); err != nil {
+	// RUN THE VM
+	if err := b.vm.RunAll(); err != nil {
+		fmt.Printf("[ERROR] VM Execution failed: %v\n", err)
 		return 0, 0, 0
 	}
 
-	// 5. Extract results from the 'out' node
-	res := b.out.Value().Data().([]float64)
+	// Reset MUST happen after RunAll but before the next call
+	defer b.vm.Reset()
+
+	val := b.out.Value()
+	if val == nil {
+		return 0, 0, 0
+	}
+	res := val.Data().([]float64)
 
 	action := 0
 	if res[0] > 0.1 {
-		action = 1 // BUILD: The AI identifies a gap and has the funds
+		action = 1
 	} else if res[0] < -0.1 {
-		action = 2 // RELOCATE: The AI identifies a failing radar in a safe zone
+		action = 2
 	}
-
-	// 6. Return results
-	// res[1] = Latitudinal Nudge (-1 to 1)
-	// res[2] = Longitudinal Nudge (-1 to 1)
 	return action, res[1], res[2]
 }
 
@@ -337,52 +327,32 @@ func loadSystemState() {
 
 func saveSystemState() {
 	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
-	// We use GOB because it preserves the tensor.Dense structures perfectly
 	f, err := os.Create(BrainFile)
 	if err == nil {
 		enc := gob.NewEncoder(f)
-
-		// Encode weights (Note: Value() returns the underlying tensor)
 		enc.Encode(brain.w0.Value())
 		enc.Encode(brain.w1.Value())
-
-		// Encode metrics for the NN to maintain its current "Era" difficulty
 		enc.Encode(minEverRadars)
 		enc.Encode(MaxRadars)
-
 		f.Close()
-	} else {
-		fmt.Printf("Error saving brain state: %v\n", err)
 	}
 
-	// 2. Save Optimized Entity Positions (Radars & Satellites)
-	// We save these to JSON so they can be reloaded as a persistent fleet
+	// 2. Save Optimized Entity Positions
 	var optimizedFleet []Entity
-
-	mu.Lock()
+	// REMOVED internal mu.Lock() here because callers must already hold it
 	for _, e := range entities {
-		// Only save persistent types. Cities are usually static,
-		// but we save them to maintain the map context.
 		if e.Type == "CITY" || e.Type == "RADAR" || e.Type == "SAT" {
 			optimizedFleet = append(optimizedFleet, *e)
 		}
 	}
-	mu.Unlock()
 
 	jsonData, err := json.MarshalIndent(optimizedFleet, "", "  ")
 	if err == nil {
-		err = os.WriteFile(RadarFile, jsonData, 0644)
-		if err != nil {
-			fmt.Printf("Error writing Radar JSON: %v\n", err)
-		}
-	} else {
-		fmt.Printf("Error marshaling entity data: %v\n", err)
+		os.WriteFile(RadarFile, jsonData, 0644)
 	}
 }
 
 func autonomousEraReset() {
-	mu.Lock()
-	defer mu.Unlock()
 
 	// 1. EVALUATE PERFORMANCE & BONUSES
 	// Reward scaling based on efficiency tiers
@@ -667,18 +637,15 @@ func getTargetedTether(quadrant int) (float64, float64) {
 
 func runPhysicsEngine() {
 	var lastLaunch time.Time
-	mu.Lock()
+
 	if simClock.IsZero() {
 		simClock = time.Now()
 		eraStartTime = simClock
 	}
-	mu.Unlock()
 
 	for {
-		mu.Lock()
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
-			mu.Unlock()
 			autonomousEraReset()
 			continue
 		}
@@ -734,7 +701,6 @@ func runPhysicsEngine() {
 			}
 		}
 		snapBudget, snapSuccess := budget, successRate
-		mu.Unlock()
 
 		// Worker Pool
 		var wg sync.WaitGroup
@@ -829,7 +795,6 @@ func runPhysicsEngine() {
 
 		go func() { wg.Wait(); close(workerKills); close(workerStats) }()
 
-		mu.Lock()
 		for lk := range workerKills {
 			for id, count := range lk {
 				if _, ok := kills[id]; ok {
@@ -890,12 +855,23 @@ func runPhysicsEngine() {
 		}
 
 		action, latN, lonN := brain.PredictSpatial(input)
+
+		// --- KICKSTART LOGIC ---
+		// If we haven't moved in 100 eras and success is low, force an action
+		if successRate < 95.0 && rand.Float64() < 0.05 {
+			if rCount < MaxRadars {
+				action = 1 // Force Build
+			} else {
+				action = 2 // Force Relocate
+			}
+		}
+
 		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
 
-		// FORCE MOVE FIX: Bypass budget if success is low
-		canAffordRelocation := budget >= RelocationCost || successRate < 90.0
+		canAffordBuild := budget >= RadarCost || successRate < 90.0
+		canAffordMove := budget >= RelocationCost || successRate < 90.0
 
-		if action == 1 && rCount < MaxRadars {
+		if action == 1 && canAffordBuild {
 			tQ := 0
 			maxM := -1.0
 			for i, m := range quadrantMisses {
@@ -912,7 +888,7 @@ func runPhysicsEngine() {
 				budget -= RadarCost
 			}
 
-		} else if action == 2 && canAffordRelocation {
+		} else if action == 2 && canAffordMove {
 			var worstID string
 			minK := 999999
 
@@ -953,9 +929,9 @@ func runPhysicsEngine() {
 				fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
 			}
 		}
-		mu.Unlock()
-		runtime.Gosched()
-		time.Sleep(1 * time.Millisecond)
+		simClock = simClock.Add(TimeStepping)
+		//runtime.Gosched()                // CRITICAL: Gives the web server/UI a window to get the lock
+		time.Sleep(1 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
 
