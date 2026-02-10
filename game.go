@@ -218,49 +218,46 @@ func NewBrain(multiplier float64) *Brain {
 }
 
 func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
-	// 1. Safety Check: Ensure the input vector matches our new 16-node architecture
+	// 1. Safety Check: Ensure the input vector matches the 16-node architecture
 	if len(inputs) != 16 {
 		fmt.Printf("[ERROR] Expected 16 inputs, got %d\n", len(inputs))
 		return 0, 0, 0
 	}
 
 	// 2. Create input tensor
-	// We use a 1x16 shape to match our Matrix multiplication requirements (1x16 * 16x24)
 	inputT := tensor.New(tensor.WithShape(1, 16), tensor.WithBacking(inputs))
 
 	// 3. Bind the tensor to the graph's input node
-	// Note: 'b.x' must be defined in your Brain struct as the input placeholder node
 	err := gorgonia.Let(b.x, inputT)
 	if err != nil {
 		return 0, 0, 0
 	}
 
 	// 4. Execution using TapeMachine
-	// We use a persistent VM if possible, or create a light one for this pass
 	vm := gorgonia.NewTapeMachine(b.g)
-	defer vm.Close() // Ensures no memory leaks during high-speed eras
+	defer vm.Close()
 
 	if err := vm.RunAll(); err != nil {
 		return 0, 0, 0
 	}
 
 	// 5. Extract results from the 'out' node
-	// 'b.out' is the final Tanh node in your graph
 	res := b.out.Value().Data().([]float64)
 
-	// 6. Strategic Action Mapping
-	// res[0] is the Action Selector (Tanh: -1 to 1)
-	action := 0
-	if res[0] > 0.4 {
-		action = 1 // BUILD: Decisive positive signal
-	} else if res[0] < -0.4 {
-		action = 2 // RELOCATE: Decisive negative signal
-	}
-	// Middle ground (-0.4 to 0.4) is STAY/OBSERVE
+	// --- FIX B & C: SENSITIVITY OVERHAUL ---
+	// We lower the threshold from 0.4 to 0.22 to break the "Relocation Lockout".
+	// This makes the AI 45% more likely to take an action rather than "idling."
 
-	// 7. Return results
-	// res[1] = Latitudinal Nudge
-	// res[2] = Longitudinal Nudge
+	action := 0
+	if res[0] > 0.22 {
+		action = 1 // BUILD: The AI identifies a gap and has the funds
+	} else if res[0] < -0.22 {
+		action = 2 // RELOCATE: The AI identifies a failing radar in a safe zone
+	}
+
+	// 6. Return results
+	// res[1] = Latitudinal Nudge (-1 to 1)
+	// res[2] = Longitudinal Nudge (-1 to 1)
 	return action, res[1], res[2]
 }
 
@@ -746,7 +743,7 @@ func runPhysicsEngine() {
 		// Worker Pool
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
-		batchSize := 200
+		batchSize := numWorkers
 		workerKills := make(chan map[string]int, numWorkers)
 		workerStats := make(chan struct {
 			ints, thrs int
@@ -872,6 +869,9 @@ func runPhysicsEngine() {
 
 		action, latN, lonN := brain.PredictSpatial(input)
 		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
+
+		canAfford := budget >= RelocationCost || successRate < 90.0
+
 		if action == 1 && rCount < MaxRadars {
 			tQ := 0
 			maxM := -1.0
@@ -888,21 +888,34 @@ func runPhysicsEngine() {
 			if budget >= RadarCost {
 				budget -= RadarCost
 			}
-		} else if action == 2 && budget >= RelocationCost {
-			var wID string
+		} else if action == 2 && canAfford {
+			var worstID string
 			minK := 999999
+			// Find the radar with the fewest kills in the LAST era
 			for id, c := range kills {
 				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
 					minK = c
-					wID = id
+					worstID = id
 				}
 			}
-			if e, ok := entities[wID]; ok {
-				bL, bO := getTetheredCoords()
-				e.Lat, e.Lon = bL+(latN*prec), bO+(lonN*prec)
+
+			if e, ok := entities[worstID]; ok {
+				// Find the quadrant with the MOST misses to move the radar TO
+				targetQ := 0
+				maxMiss := -1.0
+				for i, m := range quadrantMisses {
+					if m > maxMiss {
+						maxMiss = m
+						targetQ = i
+					}
+				}
+
+				// Move the useless radar to the crisis zone
+				bLat, bLon := getTargetedTether(targetQ)
+				e.Lat = bLat + (latN * prec)
+				e.Lon = bLon + (lonN * prec)
 				e.LastMoved = time.Now().UnixMilli()
-				kills[wID] = 0
-				budget -= RelocationCost
+				kills[worstID] = 0 // Reset stats for the new location
 			}
 		}
 		mu.Unlock()
