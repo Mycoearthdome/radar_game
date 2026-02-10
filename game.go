@@ -37,7 +37,7 @@ const (
 	Cols                    = 36 // 360 / 10
 	Rows                    = 18 // 180 / 10
 	TargetSuccess           = 100.0
-	RequiredWinStreak       = 500    // Number of eras to maintain 100% before "winning"
+	RequiredWinStreak       = 10     // Number of eras to maintain 100% before "winning"
 	MissileMaxSpeedKMH      = 8000.0 // Hypersonic Mach 6.5+
 	MissileGMLimit          = 40.0   // Max turning force
 	ProximityRadiusKM       = 5.0    // Blast zone
@@ -991,6 +991,7 @@ func runPhysicsEngine() {
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
 		mu.RLock()
 		entities_clone := entities
+		kills_clone := kills
 		mu.RUnlock()
 		for _, e := range entities_clone {
 			if e.Type != "RADAR" {
@@ -1031,9 +1032,7 @@ func runPhysicsEngine() {
 				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
 				entities_clone[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
 
-				mu.Lock()
-				kills[id] = 0
-				mu.Unlock()
+				kills_clone[id] = 0
 
 				if budget >= RadarCost {
 					budget -= RadarCost
@@ -1043,15 +1042,13 @@ func runPhysicsEngine() {
 				var worstID string
 				minK := 999999
 
-				mu.RLock()
 				// 1. Identify the most "Useless" Radar
-				for id, c := range kills {
+				for id, c := range kills_clone {
 					if e, ok := entities_clone[id]; ok && e.Type == "RADAR" && c < minK {
 						minK = c
 						worstID = id
 					}
 				}
-				mu.RUnlock()
 
 				if e, ok := entities_clone[worstID]; ok {
 					// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
@@ -1075,9 +1072,7 @@ func runPhysicsEngine() {
 
 					e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
 
-					mu.RLock()
-					kills[worstID] = 0 // Reset performance for the new era
-					mu.RUnlock()
+					kills_clone[worstID] = 0 // Reset performance for the new era
 
 					e.LastMoved = time.Now().UnixMilli()
 
@@ -1090,6 +1085,9 @@ func runPhysicsEngine() {
 		}
 		simClock = simClock.Add(TimeStepping)
 		runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
+		mu.Lock()
+		kills = kills_clone
+		mu.Unlock()
 		//time.Sleep(20 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
