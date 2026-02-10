@@ -479,21 +479,21 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 	dayProgress := 1.0 // End of era
 
 	// --- 2. NOW TRAIN THE BRAIN ---
+	mu.RLock()
 	for _, id := range radarIDs {
 		e := entities[id]
 		// Now rCount, quadrantRadars, etc. are properly defined and in scope
 		inputs := getBrainInputs(e, rCount, snapBudget, snapSuccess, quadrantRadars, satCount, dayProgress)
 
 		var idealAction []float64
-		mu.RLock()
 		if kills[id] > 0 {
 			idealAction = []float64{1.0, 0.0, 0.0} // Stay
 		} else {
 			idealAction = []float64{-1.0, 0.0, 0.0} // Move
 		}
-		mu.RUnlock()
 		brain.Train(inputs, idealAction)
 	}
+	mu.RUnlock()
 
 	// 1. EVALUATE PERFORMANCE & BONUSES
 	// Reward scaling based on efficiency tiers
@@ -577,10 +577,12 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 
 	lastEraSuccess = successRate
 
+	mu.Lock()
 	// 6. FINALIZE ERA & CLOCK SNAP
 	for id := range kills {
 		kills[id] = 0
 	}
+	mu.Unlock()
 	currentCycle++
 
 	// FIX: Explicitly snap eraStartTime to prevent simClock drift
