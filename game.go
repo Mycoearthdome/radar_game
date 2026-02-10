@@ -29,6 +29,7 @@ const (
 	InterceptReward     = 10000.0
 	EarthRadius         = 6371.0
 	EraDuration         = 24 * time.Hour
+	TimeStepping        = 20 * time.Minute
 	RadarFile           = "RADAR.json"
 	BrainFile           = "BRAIN.gob"
 	BankruptcyLimit     = 0.0
@@ -45,7 +46,7 @@ const (
 	MaxEnergy           = 100.0  // Starting energy percentage
 	DragPenaltyBase     = 0.05   // Energy loss per KM of flight
 	ManeuverEnergyCost  = 2.5    // Extra cost for high-G turns
-	MaxSatellites       = 40
+	MaxSatellites       = 20
 	SatelliteRangeKM    = 2500.0                  // Higher vantage point = wider reach
 	LaunchInterval      = 1 * 24 * 31 * time.Hour //one month
 	MissileMaxRangeKM   = 2500.0                  // The absolute maximum distance a missile can travel
@@ -859,7 +860,7 @@ func runPhysicsEngine() {
 		mu.Lock()
 
 		// Fix #2: Advance simClock by a fixed step, but snap to Era boundary
-		simTimeStep := 4 * time.Hour //CHECK!
+		simTimeStep := TimeStepping
 		simClock = simClock.Add(simTimeStep)
 
 		// Decay past misses to prevent the AI from over-reacting to old data
