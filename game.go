@@ -352,7 +352,7 @@ func loadSystemState() {
 	if data, err := os.ReadFile(RadarFile); err == nil {
 		var savedEntities []Entity
 		if err := json.Unmarshal(data, &savedEntities); err == nil {
-			mu.RLock()
+			mu.Lock()
 			// Reset entities to clear any seeded data from main()
 			entities = make(map[string]*Entity)
 
@@ -379,7 +379,7 @@ func loadSystemState() {
 					kills[e.ID] = 0
 				}
 			}
-			mu.RUnlock()
+			mu.Unlock()
 			fmt.Printf("Successfully loaded %d entities from persistence.\n", len(savedEntities))
 		}
 	}
@@ -427,6 +427,8 @@ func loadSystemState() {
 }
 
 func saveSystemState() {
+	mu.RLock() // Protect entities during JSON file preparation
+	defer mu.RUnlock()
 	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
 	f, err := os.Create(BrainFile)
 	if err == nil {
@@ -915,15 +917,16 @@ func runPhysicsEngine() {
 		}
 
 		go func() { wg.Wait(); close(workerKills); close(workerStats) }()
-		mu.Lock()
+
 		for lk := range workerKills {
+			mu.Lock()
 			for id, count := range lk {
 				if _, ok := kills[id]; ok {
 					kills[id] += count
 				}
 			}
+			mu.Unlock()
 		}
-		mu.Unlock()
 
 		for ls := range workerStats {
 			totalIntercepts += ls.ints
@@ -1086,8 +1089,8 @@ func runPhysicsEngine() {
 			}
 		}
 		simClock = simClock.Add(TimeStepping)
-		runtime.Gosched()                 // CRITICAL: Gives the web server/UI a window to get the lock
-		time.Sleep(20 * time.Millisecond) // Prevents 100% CPU lock
+		runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
+		//time.Sleep(20 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
 
@@ -1235,8 +1238,8 @@ func main() {
 	})
 
 	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
-		mu.RLock()
-		defer mu.RUnlock()
+		mu.Lock()
+		defer mu.Unlock()
 
 		// Calculate Years Per Second
 		realSeconds := time.Since(wallStart).Seconds()
