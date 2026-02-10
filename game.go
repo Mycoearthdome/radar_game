@@ -19,56 +19,90 @@ import (
 )
 
 const (
-	RadarRadiusKM     = 1200.0
-	TetherRadiusKM    = 800.0
-	RadarCost         = 50000.0
-	RelocationCost    = 5000.0
-	EnforcementFee    = 50000000.0
-	MinRadars         = 60
-	CityImpactPenalty = 2000000.0
-	InterceptReward   = 1000000.0
-	EarthRadius       = 6371.0
-	EraDuration       = 24 * time.Hour
-	RadarFile         = "RADAR.json"
-	BrainFile         = "BRAIN.gob"
-	BankruptcyLimit   = 0.0
-	GridSize          = 10 // 10 degree cells
-	Cols              = 36 // 360 / 10
-	Rows              = 18 // 180 / 10
-	TargetSuccess     = 100.0
-	RequiredWinStreak = 200 // Number of eras to maintain 100% before "winning"
+	RadarRadiusKM       = 1200.0
+	TetherRadiusKM      = 800.0
+	RadarCost           = 250000.0
+	RelocationCost      = 5000.0
+	EnforcementFee      = 5000000.0
+	MinRadars           = 60
+	CityImpactPenalty   = 200000.0
+	InterceptReward     = 10000.0
+	EarthRadius         = 6371.0
+	EraDuration         = 24 * time.Hour
+	RadarFile           = "RADAR.json"
+	BrainFile           = "BRAIN.gob"
+	BankruptcyLimit     = 0.0
+	GridSize            = 10 // 10 degree cells
+	Cols                = 36 // 360 / 10
+	Rows                = 18 // 180 / 10
+	TargetSuccess       = 100.0
+	RequiredWinStreak   = 5000   // Number of eras to maintain 100% before "winning"
+	MissileMaxSpeedKMH  = 8000.0 // Hypersonic Mach 6.5+
+	MissileGMLimit      = 40.0   // Max turning force
+	ProximityRadiusKM   = 5.0    // Blast zone
+	KineticRadiusKM     = 0.1    // Direct hit
+	BaseKillProbability = 0.85   // Success rate for proximity detonation
+	MaxEnergy           = 100.0  // Starting energy percentage
+	DragPenaltyBase     = 0.05   // Energy loss per KM of flight
+	ManeuverEnergyCost  = 2.5    // Extra cost for high-G turns
+	MaxSatellites       = 40
+	SatelliteRangeKM    = 2500.0                  // Higher vantage point = wider reach
+	LaunchInterval      = 1 * 24 * 31 * time.Hour //one month
+	MissileMaxRangeKM   = 2500.0                  // The absolute maximum distance a missile can travel
+	FuelConsumption     = 0.04                    // Energy/Fuel cost per KM traveled by the threat
+	StartBudget         = 10000000000000.0
+	EmergencyBudget     = StartBudget / 2
 )
 
 var (
-	entities         = make(map[string]*Entity)
-	kills            = make(map[string]int)
-	budget           = 2000000000.0
-	totalEraSpending = 0.0
-	mu               sync.RWMutex
-	eraStartTime     time.Time
-	simClock         time.Time
-	wallStart        time.Time // For Benchmark
-	currentCycle     = 1
-	brain            *Brain
-	successRate      float64
-	totalThreats     int
-	totalIntercepts  int
-	MaxRadars        = 500
-	minEverRadars    = MaxRadars
-	forceReset       = false
-	cityNames        []string
-	mutationRate     = 1.0
-	quadrantMisses   = make([]float64, 4) // [NW, NE, SW, SE]
-	winStreakCounter = 0
-	isSimulationOver = false
-	EfficiencyBonus  = 100000.0
+	entities             = make(map[string]*Entity)
+	kills                = make(map[string]int)
+	budget               = StartBudget
+	totalEraSpending     = 0.0
+	mu                   sync.RWMutex
+	eraStartTime         time.Time
+	simClock             time.Time
+	wallStart            time.Time // For Benchmark
+	currentCycle         = 1
+	brain                *Brain
+	successRate          float64
+	totalThreats         int
+	totalIntercepts      int
+	MaxRadars            = 500
+	minEverRadars        = MaxRadars
+	forceReset           = false
+	cityNames            []string
+	mutationRate         = 0.01               //was 1.0
+	quadrantMisses       = make([]float64, 4) // [NW, NE, SW, SE]
+	winStreakCounter     = 0
+	isSimulationOver     = false
+	EfficiencyBonus      = 100000.0
+	difficultyMultiplier = 1.0
 )
 
+var launchSites = []struct{ Lat, Lon float64 }{
+	{28.57, -80.64},  // Cape Canaveral
+	{34.74, -120.57}, // Vandenberg
+	{5.23, -52.76},   // Kourou
+	{45.96, 63.30},   // Baikonur
+	{18.65, 100.48},  // Jiuquan
+}
+
+type Satellite struct {
+	ID        string
+	LaunchLat float64
+	LaunchLon float64
+	StartTime int64
+}
+
 type Entity struct {
-	ID        string  `json:"id" gob:"id"`
-	Type      string  `json:"type" gob:"type"`
-	Lat       float64 `json:"lat" gob:"lat"`
-	Lon       float64 `json:"lon" gob:"lon"`
+	ID        string  `json:"id"`
+	Type      string  `json:"type"`
+	Lat       float64 `json:"lat"`
+	Lon       float64 `json:"lon"`
+	LaunchLat float64 `json:"launch_lat"`
+	LaunchLon float64 `json:"launch_lon"`
+	StartTime int64   `json:"start_time"`
 	LastMoved int64   `json:"last_moved"`
 }
 
@@ -106,10 +140,34 @@ func (b *Brain) Mutate(rate float64) {
 }
 
 func (b *Brain) AdaptiveMutate(success float64) {
-	// High success (99%) = tiny jitter (0.01)
-	// Low success (50%) = large jitter (0.2)
+	// 1. Calculate Dynamic Jitter Rate
+	// High success (99%) = tiny jitter (0.002) - fine-tuning only.
+	// Low success (50%) = large jitter (0.1) - seeking new strategies.
 	rate := 0.2 * (1.0 - (success / 100.0))
-	b.Mutate(rate)
+
+	// Clamp the rate to avoid total brain-wipe
+	if rate < 0.002 {
+		rate = 0.002
+	}
+
+	fmt.Printf("[Mutation] Success: %.2f%% | Applying Jitter Rate: %.5f\n", success, rate)
+
+	// 2. Access the Raw Data of the weights
+	// We mutate both the input-to-hidden (w0) and hidden-to-output (w1) layers.
+	for _, w := range []*gorgonia.Node{b.w0, b.w1} {
+		wT := w.Value().Data().([]float64)
+
+		for i := range wT {
+			// BIAS TOWARD STABILITY:
+			// Only mutate a percentage of weights based on the success rate.
+			// If success is 90%, only 10% of weights get jittered.
+			if rand.Float64() > (success / 100.0) {
+				// Apply Gaussian jitter
+				jitter := rand.NormFloat64() * rate
+				wT[i] += jitter
+			}
+		}
+	}
 }
 
 // Helper to get grid ID from coordinates
@@ -121,41 +179,71 @@ func getGridID(lat, lon float64) int {
 
 func NewBrain(multiplier float64) *Brain {
 	g := gorgonia.NewGraph()
-	// Input: [Budget/Limit, RadarCount/Max, SuccessRate, MissNW, MissNE, MissSW, MissSE]
-	x := gorgonia.NewVector(g, tensor.Float64, gorgonia.WithShape(7), gorgonia.WithName("x"))
 
-	// Update Hidden layer input shape to 7
-	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(7, 16), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(16, 5), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+	// 12 Inputs: [0:Budget, 1:Radars, 2:Success, 3-6:Misses, 7:SatCount, 8-11:RadarDensity]
+	inputSize := 12
+	hiddenSize := 16
+	outputSize := 3 // Simplified to exact needs: [Action, LatNudge, LonNudge]
 
-	l0 := gorgonia.Must(gorgonia.Rectify(gorgonia.Must(gorgonia.Mul(x, w0))))
-	out := gorgonia.Must(gorgonia.Tanh(gorgonia.Must(gorgonia.Mul(l0, w1))))
+	// Define Weights with specific initializers
+	w0 := gorgonia.NewMatrix(g, tensor.Float64,
+		gorgonia.WithShape(inputSize, hiddenSize),
+		gorgonia.WithName("w0"),
+		gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
 
-	vm := gorgonia.NewTapeMachine(g)
-	return &Brain{g: g, w0: w0, w1: w1, x: x, out: out, vm: vm}
+	w1 := gorgonia.NewMatrix(g, tensor.Float64,
+		gorgonia.WithShape(hiddenSize, outputSize),
+		gorgonia.WithName("w1"),
+		gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+
+	// We no longer define 'x' and 'out' here if we want a dynamic TapeMachine,
+	// but keeping them as pointers in the struct is fine for reference.
+	return &Brain{
+		g:  g,
+		w0: w0,
+		w1: w1,
+	}
 }
 
-func (b *Brain) PredictSpatial(input []float64) (action int, latNudge, lonNudge float64) {
-	gorgonia.Let(b.x, tensor.New(tensor.WithBacking(input)))
-	b.vm.RunAll()
-	res := b.out.Value().Data().([]float64)
-	b.vm.Reset()
+func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
+	// Create input tensor for this specific prediction
+	inputT := tensor.New(tensor.WithShape(12), tensor.WithBacking(inputs))
+	x := gorgonia.NodeFromAny(b.g, inputT, gorgonia.WithName("x_input"))
 
-	// 1. Determine Action (Argmax of the first 3 nodes)
-	action = 0
-	maxVal := res[0]
-	for i := 1; i < 3; i++ {
-		if res[i] > maxVal {
-			action = i
-			maxVal = res[i]
-		}
+	// --- Forward Pass ---
+	// Layer 0: Input * W0
+	h0 := gorgonia.Must(gorgonia.Mul(x, b.w0))
+
+	// FIX: Use LeakyRectify instead of Rectify to prevent Dead Neurons
+	// This keeps the gradient flowing even for negative inputs.
+	activated := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.01))
+
+	// Layer 1: Hidden * W1 -> Tanh for action/spatial nudges
+	out := gorgonia.Must(gorgonia.Mul(activated, b.w1))
+	out = gorgonia.Must(gorgonia.Tanh(out))
+
+	// --- Execution ---
+	vm := gorgonia.NewTapeMachine(b.g)
+	if err := vm.RunAll(); err != nil {
+		vm.Close()
+		return 0, 0, 0
 	}
 
-	// 2. Extract Spatial Nudges (Nodes 3 and 4)
-	latNudge = res[3]
-	lonNudge = res[4]
+	res := out.Value().Data().([]float64)
+	vm.Close() // CRUCIAL: Prevent memory leaks
 
-	return action, latNudge, lonNudge
+	// --- Action Logic ---
+	action := 0
+	// Tanh outputs are -1 to 1.
+	// > 0.33 -> BUILD | < -0.33 -> RELOCATE | Else -> STAY
+	if res[0] > 0.33 {
+		action = 1
+	} else if res[0] < -0.33 {
+		action = 2
+	}
+
+	// res[1] and res[2] are used for latNudge and lonNudge
+	return action, res[1], res[2]
 }
 
 func (b *Brain) Predict(input []float64) int {
@@ -173,26 +261,41 @@ func (b *Brain) Predict(input []float64) int {
 }
 
 func loadSystemState() {
-	// 1. Load Radar Positions
 	if data, err := os.ReadFile(RadarFile); err == nil {
 		var savedEntities []Entity
 		if err := json.Unmarshal(data, &savedEntities); err == nil {
 			mu.Lock()
+			// Reset entities to clear any seeded data from main()
+			entities = make(map[string]*Entity)
+
 			for _, e := range savedEntities {
+				newE := &Entity{
+					ID: e.ID, Type: e.Type,
+					Lat: e.Lat, Lon: e.Lon,
+					LaunchLat: e.LaunchLat, LaunchLon: e.LaunchLon,
+					StartTime: e.StartTime, LastMoved: e.LastMoved,
+				}
+
+				// FIX 1: Sync Satellite Orbital Clocks
+				// If we are loading a satellite, we must ensure its StartTime
+				// relative to the current simClock is preserved or reset
+				// to prevent orbital jumping.
+				if e.Type == "SAT" && simClock.IsZero() == false {
+					newE.StartTime = simClock.Unix()
+				}
+
+				entities[e.ID] = newE
+
+				// Re-initialize kills map for radars
 				if e.Type == "RADAR" {
-					entities[e.ID] = &Entity{
-						ID: e.ID, Type: e.Type,
-						Lat: e.Lat, Lon: e.Lon,
-						LastMoved: e.LastMoved,
-					}
 					kills[e.ID] = 0
 				}
 			}
 			mu.Unlock()
+			fmt.Printf("Successfully loaded %d entities from persistence.\n", len(savedEntities))
 		}
 	}
 
-	// 2. Load NN and Scaling Benchmarks
 	f, err := os.Open(BrainFile)
 	if err != nil {
 		return
@@ -202,51 +305,81 @@ func loadSystemState() {
 	dec := gob.NewDecoder(f)
 	var w0T, w1T *tensor.Dense
 
+	// FIX 2: Correct Input Migration Logic
 	if err := dec.Decode(&w0T); err == nil {
-		gorgonia.Let(brain.w0, w0T)
+		currentShape := w0T.Shape()[0]
+		// Migration logic for 12-input architecture
+		if currentShape < 12 {
+			fmt.Printf("Migrating %d-input brain to 12-input...\n", currentShape)
+			newW0 := tensor.New(tensor.WithShape(12, 16), tensor.WithBacking(make([]float64, 12*16)))
+			oldData := w0T.Data().([]float64)
+			newData := newW0.Data().([]float64)
+
+			// Copy old weights into the new larger tensor
+			copy(newData, oldData)
+
+			// Initialize the new "knowledge" rows (Satellite and Density awareness)
+			// using a small jitter so the AI starts with neutral curiosity.
+			for i := len(oldData); i < 192; i++ {
+				newData[i] = (rand.Float64() - 0.5) * 0.01
+			}
+			gorgonia.Let(brain.w0, newW0)
+		} else {
+			gorgonia.Let(brain.w0, w0T)
+		}
 	}
+
 	if err := dec.Decode(&w1T); err == nil {
 		gorgonia.Let(brain.w1, w1T)
 	}
 
+	// Ensure we preserve the historical "Tightest Fleet" record
 	dec.Decode(&minEverRadars)
-	dec.Decode(&MaxRadars) // Recover the target scale
-}
-
-func getTetheredCoords() (float64, float64) {
-	city := entities[cityNames[rand.Intn(len(cityNames))]]
-	lat := city.Lat + (rand.Float64()-0.5)*14.0
-	lon := city.Lon + (rand.Float64()-0.5)*14.0
-	if getDistanceKM(city.Lat, city.Lon, lat, lon) > TetherRadiusKM {
-		return city.Lat, city.Lon
-	}
-	return lat, lon
+	dec.Decode(&MaxRadars)
 }
 
 func saveSystemState() {
-
 	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
+	// We use GOB because it preserves the tensor.Dense structures perfectly
 	f, err := os.Create(BrainFile)
 	if err == nil {
 		enc := gob.NewEncoder(f)
+
+		// Encode weights (Note: Value() returns the underlying tensor)
 		enc.Encode(brain.w0.Value())
 		enc.Encode(brain.w1.Value())
+
+		// Encode metrics for the NN to maintain its current "Era" difficulty
 		enc.Encode(minEverRadars)
-		enc.Encode(MaxRadars) // Persist the scaling limit
+		enc.Encode(MaxRadars)
+
 		f.Close()
+	} else {
+		fmt.Printf("Error saving brain state: %v\n", err)
 	}
 
-	// 2. Save Optimized Radar Positions
+	// 2. Save Optimized Entity Positions (Radars & Satellites)
+	// We save these to JSON so they can be reloaded as a persistent fleet
 	var optimizedFleet []Entity
+
+	mu.Lock()
 	for _, e := range entities {
-		if e.Type == "CITY" || e.Type == "RADAR" {
+		// Only save persistent types. Cities are usually static,
+		// but we save them to maintain the map context.
+		if e.Type == "CITY" || e.Type == "RADAR" || e.Type == "SAT" {
 			optimizedFleet = append(optimizedFleet, *e)
 		}
 	}
+	mu.Unlock()
 
 	jsonData, err := json.MarshalIndent(optimizedFleet, "", "  ")
 	if err == nil {
-		os.WriteFile(RadarFile, jsonData, 0644)
+		err = os.WriteFile(RadarFile, jsonData, 0644)
+		if err != nil {
+			fmt.Printf("Error writing Radar JSON: %v\n", err)
+		}
+	} else {
+		fmt.Printf("Error marshaling entity data: %v\n", err)
 	}
 }
 
@@ -254,15 +387,22 @@ func autonomousEraReset() {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// 1. EVALUATE WIN STREAK
+	// 1. EVALUATE PERFORMANCE & BONUSES
+	// Reward scaling based on efficiency tiers
 	if successRate >= 100.0 {
-		EfficiencyBonus = EfficiencyBonus * 1.1 //reward
-	} else if successRate < 100.0 && successRate >= 99.5 {
+		difficultyMultiplier += 0.1 // Threats get 10% faster every era the AI wins
+		EfficiencyBonus = EfficiencyBonus * 1.1
+	} else if successRate >= 99.0 {
+		difficultyMultiplier += 0.05 // Threats get 5% faster every era the AI wins
+		EfficiencyBonus = EfficiencyBonus * 1.05
+	} else if successRate >= 99.5 {
 		EfficiencyBonus = EfficiencyBonus * 1.025
 	} else {
-		EfficiencyBonus = 100000.0
+		EfficiencyBonus = 100000.0 // Reset to baseline on failure
 	}
 
+	// 2. WIN STREAK & CONVERGENCE
+	// Ensure a minimum threat volume before counting a 'Win' to prevent cheesing
 	if successRate >= 100.0 && (totalThreats+totalIntercepts) > 50 {
 		winStreakCounter++
 		fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
@@ -274,12 +414,9 @@ func autonomousEraReset() {
 			fmt.Println("==================================================")
 
 			isSimulationOver = true
-			saveSystemState() // Final save of the champion model
-
-			// Exit the program after a brief delay for the UI to catch the final state
+			saveSystemState()
 			go func() {
 				time.Sleep(2 * time.Second)
-				fmt.Println("Shutting down simulation...")
 				os.Exit(0)
 			}()
 			return
@@ -291,7 +428,8 @@ func autonomousEraReset() {
 		winStreakCounter = 0
 	}
 
-	var radarIDs []string
+	// 3. TARGET SCALING (Fleet Tightening)
+	radarIDs := []string{}
 	for id, e := range entities {
 		if e.Type == "RADAR" {
 			radarIDs = append(radarIDs, id)
@@ -299,68 +437,113 @@ func autonomousEraReset() {
 	}
 	rCount := len(radarIDs)
 
-	// 2. DETECT STAGNATION
-	if rCount < MinRadars && budget < RadarCost {
-		fmt.Println("STAGNATION DETECTED: Emergency Capital Injection...")
-		budget = 20000000.0
-		brain.AdaptiveMutate(successRate)
-	}
-
-	// 3. TARGET SCALING
 	if successRate >= 99.5 && (totalThreats+totalIntercepts) >= 50 {
 		if rCount < minEverRadars {
 			minEverRadars = rCount
-			MaxRadars = minEverRadars // Lower the ceiling for the AI
+			MaxRadars = minEverRadars
 			fmt.Printf("\nNEW RECORD: Max fleet size tightened to %d units.\n", MaxRadars)
 			saveSystemState()
-			EfficiencyBonus = 200000.0 //reward
 		}
 	}
 
-	// 4. BANKRUPTCY & ADAPTIVE MUTATION
-	if budget < -BankruptcyLimit {
-		fmt.Println("\nCRISIS: Mutating Brain weights...")
-		brain.AdaptiveMutate(successRate)
-		budget = 1000000000.0
-	}
-
-	// 5. AGGRESSIVE PRUNING
+	// 4. AGGRESSIVE PRUNING WITH NEWBORN PROTECTION
 	if successRate >= 95.0 {
+		// Sort by kills (Ascending)
 		sort.Slice(radarIDs, func(i, j int) bool {
 			return kills[radarIDs[i]] < kills[radarIDs[j]]
 		})
 
 		numToDrop := int(float64(rCount) * 0.15)
 		dropped := 0
-		for i := 0; i < numToDrop; i++ {
-			if len(radarIDs)-dropped <= MinRadars {
+		now := simClock.Unix() // Use the simulation clock for timing
+
+		// 6-hour protection window in simulation time
+		gracePeriodSeconds := int64(6 * time.Hour.Seconds())
+
+		for _, id := range radarIDs {
+			// Stop if we've dropped enough or hit the floor
+			if dropped >= numToDrop || (len(radarIDs)-dropped) <= MinRadars {
 				break
 			}
-			id := radarIDs[i]
+
+			e, exists := entities[id]
+			if !exists {
+				continue
+			}
+
+			// --- THE FIX: NEWBORN GRACE PERIOD ---
+			// If the radar is younger than 6 hours, skip it.
+			// It hasn't had enough "exposure time" to prove its worth.
+			if (now - e.StartTime) < gracePeriodSeconds {
+				continue
+			}
+
+			// If it's old enough and still has 0 or low kills, prune it
 			delete(entities, id)
 			delete(kills, id)
 			dropped++
 
-			// Reward for doing more with less
+			// Refund/Efficiency Reward logic
 			scalingFactor := 1.0 + (100.0 / float64(len(entities)-len(cityNames)+1))
 			budget += EfficiencyBonus * scalingFactor
 		}
 		saveSystemState()
 	}
 
-	// 6. FINALIZE ERA
+	// 5. CRISIS RECOVERY
+	if budget < -BankruptcyLimit || (rCount < MinRadars && budget < RadarCost) {
+		fmt.Println("\nCRISIS: Adaptive Mutation Triggered...")
+		brain.AdaptiveMutate(successRate)
+		budget = EmergencyBudget // Emergency Capital Injection
+	}
+
+	// 6. FINALIZE ERA & CLOCK SNAP
 	for id := range kills {
 		kills[id] = 0
 	}
 	currentCycle++
-	eraStartTime = simClock
-	if budget < 500000.0 {
-		budget = 500000.0
-	}
+
+	// FIX: Explicitly snap eraStartTime to prevent simClock drift
+	eraStartTime = eraStartTime.Add(EraDuration)
+	simClock = eraStartTime
+
+	wallStart = time.Now()
 	totalThreats, totalIntercepts = 0, 0
 	for i := range quadrantMisses {
 		quadrantMisses[i] = 0
 	}
+}
+
+// getSatellitePos calculates the current Lat/Lon based on launch origin and orbital mechanics.
+func getSatellitePos(startTime int64, launchLat, launchLon float64, currentTime time.Time) (float64, float64) {
+	// 1. Calculate time elapsed since launch in hours
+	elapsed := currentTime.Sub(time.Unix(startTime, 0)).Hours()
+
+	// 2. LATITUDE (Sine wave with phase shift)
+	// We use the launchLat to determine the phase shift so the satellite
+	// starts at the launch site, not the equator.
+	amplitude := 60.0
+
+	// Ensure launchLat is within the sine amplitude range (-60 to 60)
+	clampedLat := math.Max(-amplitude, math.Min(amplitude, launchLat))
+	phase := math.Asin(clampedLat / amplitude)
+
+	// Period of 1.5 hours (2 * Pi / 1.5)
+	periodFactor := math.Pi / 0.75
+	lat := amplitude * math.Sin((elapsed*periodFactor)+phase)
+
+	// 3. LONGITUDE (Linear movement)
+	// Longitude increases based on orbital speed.
+	lon := launchLon + (elapsed * 25.0)
+
+	// Wrap around the globe correctly to stay within -180 to 180
+	lon = math.Mod(lon+180, 360)
+	if lon < 0 {
+		lon += 360
+	}
+	lon -= 180
+
+	return lat, lon
 }
 
 func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
@@ -370,35 +553,204 @@ func getDistanceKM(lat1, lon1, lat2, lon2 float64) float64 {
 	return EarthRadius * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
 
-func runPhysicsEngine() {
-	for {
-		// 2. ERA TRANSITION & SPATIAL INDEXING
-		mu.Lock()
-		if simClock.IsZero() {
-			simClock = time.Now()
-			eraStartTime = time.Now()
+func getTetheredCoords() (float64, float64) {
+	// Pick a random city to anchor the new radar
+	city := entities[cityNames[rand.Intn(len(cityNames))]]
+
+	// Random offset within the tether radius (~7-8 degrees is roughly 800km)
+	lat := city.Lat + (rand.Float64()-0.5)*14.0
+	lon := city.Lon + (rand.Float64()-0.5)*14.0
+
+	// Safety check: ensure it's actually within range
+	if getDistanceKM(city.Lat, city.Lon, lat, lon) > TetherRadiusKM {
+		return city.Lat, city.Lon
+	}
+	return lat, lon
+}
+
+func simulateHomingIntercept(sensor *Entity, target *Entity, threatLat, threatLon float64) bool {
+	// 1. Base Probability (Space assets start higher but are more sensitive to physics)
+	pk := 0.75
+	if sensor.Type == "SAT" {
+		pk = 0.85
+
+		// 2. TRUE DYNAMIC RELATIVE VELOCITY (Fix)
+		// We look 10s into the future to establish a velocity vector
+		currLat, currLon := sensor.Lat, sensor.Lon
+		futureLat, futureLon := getSatellitePos(sensor.StartTime, sensor.LaunchLat, sensor.LaunchLon, simClock.Add(10*time.Second))
+
+		distNow := getDistanceKM(currLat, currLon, threatLat, threatLon)
+		distFuture := getDistanceKM(futureLat, futureLon, threatLat, threatLon)
+
+		// relativeVelocityFactor: Positive means head-on closing, Negative means tail-chase
+		// At 25,000 KM/H, this factor is roughly 7.0 KM/s
+		relativeVelocityFactor := (distNow - distFuture) / 10.0
+
+		// Apply the Difficulty Multiplier to the threat speed
+		// This makes high-speed "Tail-chase" intercepts mathematically near-impossible
+		threatDifficulty := 1.0 + (difficultyMultiplier * 0.2) // Scales with your win streak
+
+		if relativeVelocityFactor > 0 {
+			// Head-on: Closing speed helps, but difficulty reduces the window
+			pk += (0.15 * (relativeVelocityFactor / 7.0)) / threatDifficulty
+		} else {
+			// Tail-chase: Drastic penalty. If the threat is faster than the SAT's ability
+			// to maneuver (relativeVelocityFactor is highly negative), Pk drops to near zero.
+			pk += (relativeVelocityFactor / 5.0) * threatDifficulty
 		}
+	}
+
+	// 3. Distance Decay (Non-Linear)
+	// Real interceptors lose energy exponentially at the edge of their envelope.
+	distToTarget := getDistanceKM(sensor.Lat, sensor.Lon, target.Lat, target.Lon)
+	maxRange := RadarRadiusKM
+	if sensor.Type == "SAT" {
+		maxRange = SatelliteRangeKM
+	}
+
+	// Use a power function to make the "edge" of the radar range much deadlier for accuracy
+	distanceFactor := math.Pow(1.0-(distToTarget/maxRange), 1.5)
+
+	// Apply difficulty to the distance factor - making the "effective" range smaller
+	finalPk := pk * (0.6 + 0.4*distanceFactor) / difficultyMultiplier
+
+	// 4. Hard Floor/Cap
+	if finalPk < 0.05 {
+		finalPk = 0.05
+	} // Never 0, always a "lucky" chance
+	if finalPk > 0.98 {
+		finalPk = 0.98
+	} // Never 100%, "system failure" chance
+
+	return rand.Float64() < finalPk
+}
+
+// getTargetedTether finds a city specifically within the quadrant the AI wants to reinforce.
+func getTargetedTether(quadrant int) (float64, float64) {
+	var candidates []string
+
+	mu.RLock()
+	for _, name := range cityNames {
+		city := entities[name]
+		// Map Lat/Lon to 0-3 Quadrant ID (NW: 0, NE: 1, SW: 2, SE: 3)
+		qIdx := 0
+		if city.Lat < 0 {
+			qIdx += 2
+		} // South
+		if city.Lon > 0 {
+			qIdx += 1
+		} // East
+
+		if qIdx == quadrant {
+			candidates = append(candidates, name)
+		}
+	}
+	mu.RUnlock()
+
+	// Fallback: If no cities exist in that specific quadrant, use global random tether
+	if len(candidates) == 0 {
+		return getTetheredCoords()
+	}
+
+	// Pick a random city from the correct quadrant
+	targetCityName := candidates[rand.Intn(len(candidates))]
+	mu.RLock()
+	targetCity := entities[targetCityName]
+	lat, lon := targetCity.Lat, targetCity.Lon
+	mu.RUnlock()
+
+	// Apply tethering radius (800km) to scatter radars around the city
+	lat += (rand.Float64() - 0.5) * 14.0
+	lon += (rand.Float64() - 0.5) * 14.0
+
+	return lat, lon
+}
+
+func runPhysicsEngine() {
+	var lastLaunch time.Time
+
+	// Ensure initialization
+	mu.Lock()
+	if simClock.IsZero() {
+		simClock = time.Now()
+		eraStartTime = simClock
+	}
+	mu.Unlock()
+
+	for {
+		// 1. ERA BOUNDARY CHECK & RESET
+		mu.Lock()
+		// Check if the next step would overshoot the Era duration
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
 			autonomousEraReset()
 			continue
 		}
+		mu.Unlock()
 
-		// Rebuild Spatial Index for this batch
-		spatialIndex := make(map[int][]string)
-		for id, e := range entities {
-			if e.Type == "RADAR" {
-				gID := getGridID(e.Lat, e.Lon)
-				spatialIndex[gID] = append(spatialIndex[gID], id)
+		// 2. SATELLITE CONSTELLATION MANAGEMENT
+		mu.Lock()
+		satCount := 0
+		for _, e := range entities {
+			if e.Type == "SAT" {
+				satCount++
+			}
+		}
+
+		if satCount < MaxSatellites && simClock.Sub(lastLaunch) >= LaunchInterval {
+			site := launchSites[rand.Intn(len(launchSites))]
+			id := fmt.Sprintf("SAT-%d-%d", currentCycle, satCount)
+			entities[id] = &Entity{
+				ID: id, Type: "SAT",
+				LaunchLat: site.Lat, LaunchLon: site.Lon,
+				Lat: site.Lat, Lon: site.Lon,
+				StartTime: simClock.Unix(),
+			}
+			lastLaunch = simClock
+		}
+
+		// Update Orbital Positions based on the decoupled simClock
+		for _, e := range entities {
+			if e.Type == "SAT" {
+				e.Lat, e.Lon = getSatellitePos(e.StartTime, e.LaunchLat, e.LaunchLon, simClock)
 			}
 		}
 		mu.Unlock()
 
-		// 3. MULTI-THREADED THREAT BATCH (Spatial Optimized)
+		// 3. SPATIAL INDEXING
+		mu.Lock()
+		spatialIndex := make(map[int][]string)
+		cityIndex := make(map[int][]string)
+		quadrantRadars := make([]float64, 4)
+		rCount := 0
+
+		for id, e := range entities {
+			gID := getGridID(e.Lat, e.Lon)
+			switch e.Type {
+			case "RADAR":
+				spatialIndex[gID] = append(spatialIndex[gID], id)
+				rCount++
+				qIdx := 0
+				if e.Lat < 0 {
+					qIdx += 2
+				}
+				if e.Lon > 0 {
+					qIdx += 1
+				}
+				quadrantRadars[qIdx]++
+			case "SAT":
+				spatialIndex[gID] = append(spatialIndex[gID], id)
+			case "CITY":
+				cityIndex[gID] = append(cityIndex[gID], id)
+			}
+		}
+		mu.Unlock()
+
+		// 4. MULTI-THREADED THREAT SIMULATION
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
-		batchSize := 1000
+		batchSize := 100000 // Increased per your "winning too easily" feedback
 
 		for w := 0; w < numWorkers; w++ {
 			wg.Add(1)
@@ -409,45 +761,64 @@ func runPhysicsEngine() {
 				lInt, lThr, lRew, lPen := 0, 0, 0.0, 0.0
 
 				for i := 0; i < batchSize/numWorkers; i++ {
+					spawnLat := (rand.Float64() * 180.0) - 90.0
+					spawnLon := (rand.Float64() * 360.0) - 180.0
+					spawnGrid := getGridID(spawnLat, spawnLon)
+
+					var targetCity *Entity
 					mu.RLock()
-					target := entities[cityNames[rand.Intn(len(cityNames))]]
+				citySearch:
+					for r := -3; r <= 3; r++ {
+						for c := -3; c <= 3; c++ {
+							checkID := spawnGrid + (r * Cols) + c
+							for _, cityName := range cityIndex[checkID] {
+								// DEFENSIVE: Verify city still exists in map
+								city, exists := entities[cityName]
+								if exists && city != nil {
+									if getDistanceKM(spawnLat, spawnLon, city.Lat, city.Lon) < MissileMaxRangeKM {
+										targetCity = city
+										break citySearch
+									}
+								}
+							}
+						}
+					}
 					mu.RUnlock()
 
-					// NEW SAFETY CHECK: prevent nil pointer dereference
-					if target == nil {
+					if targetCity == nil {
 						continue
 					}
 
 					intercepted := false
-					targetGrid := getGridID(target.Lat, target.Lon)
-
-					// Only check target cell and neighbors
 					mu.RLock()
-					for r := -1; r <= 1; r++ {
-						for c := -1; c <= 1; c++ {
+					targetGrid := getGridID(targetCity.Lat, targetCity.Lon)
+				outerBreak:
+					for r := -2; r <= 2; r++ {
+						for c := -2; c <= 2; c++ {
 							checkID := targetGrid + (r * Cols) + c
-							for _, radarID := range spatialIndex[checkID] {
-								e, exists := entities[radarID]
-
-								// Check BOTH if it exists AND is not nil before accessing fields
-								if !exists || e == nil {
+							for _, sensorID := range spatialIndex[checkID] {
+								// DEFENSIVE: Verify sensor still exists
+								sensor, exists := entities[sensorID]
+								if !exists || sensor == nil {
 									continue
 								}
 
-								if getDistanceKM(e.Lat, e.Lon, target.Lat, target.Lon) < RadarRadiusKM {
-									localKills[radarID]++
-									lInt++
-									lRew += InterceptReward
-									intercepted = true
-									break
+								rangeLimit := RadarRadiusKM
+								if sensor.Type == "SAT" {
+									rangeLimit = SatelliteRangeKM
+								}
+
+								if getDistanceKM(sensor.Lat, sensor.Lon, targetCity.Lat, targetCity.Lon) < rangeLimit {
+									// DEFENSIVE: Final check before physics calculation
+									if simulateHomingIntercept(sensor, targetCity, spawnLat, spawnLon) {
+										localKills[sensorID]++
+										lInt++
+										lRew += InterceptReward
+										intercepted = true
+										break outerBreak
+									}
 								}
 							}
-							if intercepted {
-								break
-							}
-						}
-						if intercepted {
-							break
 						}
 					}
 					mu.RUnlock()
@@ -456,20 +827,22 @@ func runPhysicsEngine() {
 						lThr++
 						lPen += CityImpactPenalty
 						qIdx := 0
-						if target.Lat < 0 {
+						if targetCity.Lat < 0 {
 							qIdx += 2
 						}
-						if target.Lon > 0 {
+						if targetCity.Lon > 0 {
 							qIdx += 1
 						}
 						localMisses[qIdx]++
 					}
 				}
 
-				// Final merge: minimizing global lock time
+				// Sync local worker results to global state
 				mu.Lock()
 				for id, count := range localKills {
-					kills[id] += count
+					if _, exists := kills[id]; exists {
+						kills[id] += count
+					}
 				}
 				for i, val := range localMisses {
 					quadrantMisses[i] += val
@@ -482,53 +855,83 @@ func runPhysicsEngine() {
 		}
 		wg.Wait()
 
-		// 4. AI DECISION PHASE
+		// 5. AI STRATEGY & DYNAMIC TEMPORAL STEP
 		mu.Lock()
-		simClock = simClock.Add(4 * time.Hour)
+
+		// Fix #2: Advance simClock by a fixed step, but snap to Era boundary
+		simTimeStep := 4 * time.Hour //CHECK!
+		simClock = simClock.Add(simTimeStep)
+
+		// Decay past misses to prevent the AI from over-reacting to old data
+		for i := range quadrantMisses {
+			quadrantMisses[i] *= 0.90
+		}
+
 		if totalThreats+totalIntercepts > 0 {
 			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
 
-		rCount := 0
-		for _, e := range entities {
-			if e.Type == "RADAR" {
-				rCount++
-			}
-		}
-
 		input := []float64{
-			math.Max(-1, math.Min(budget/BankruptcyLimit, 1.0)),
+			math.Max(-1, math.Min(budget/1000000000.0, 1.0)),
 			float64(rCount) / float64(MaxRadars),
 			successRate / 100.0,
 			math.Min(quadrantMisses[0]/50, 1.0),
 			math.Min(quadrantMisses[1]/50, 1.0),
 			math.Min(quadrantMisses[2]/50, 1.0),
 			math.Min(quadrantMisses[3]/50, 1.0),
+			float64(satCount) / float64(MaxSatellites),
+			math.Min(quadrantRadars[0]/20, 1.0),
+			math.Min(quadrantRadars[1]/20, 1.0),
+			math.Min(quadrantRadars[2]/20, 1.0),
+			math.Min(quadrantRadars[3]/20, 1.0),
 		}
 
 		action, latNudge, lonNudge := brain.PredictSpatial(input)
 		precisionScale := 20.0 * (1.0 - (successRate / 100.0))
-		if precisionScale < 1.0 {
-			precisionScale = 1.0
+		if precisionScale < 5.0 {
+			precisionScale = 5.0
 		}
 
 		switch action {
 		case 1: // BUILD
 			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
-				baseLat, baseLon := getTetheredCoords()
-				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-				entities[id] = &Entity{
-					ID: id, Type: "RADAR",
-					Lat: baseLat + (latNudge * precisionScale * 2.0),
-					Lon: baseLon + (lonNudge * precisionScale * 2.0),
+				// 1. Identify the "Hot Zone" (quadrant with the most recent misses)
+				targetQ := 0
+				maxM := -1.0
+				for i, m := range quadrantMisses {
+					if m > maxM {
+						maxM = m
+						targetQ = i
+					}
 				}
-				budget -= RadarCost
+
+				// 2. Get coords specifically in that quadrant to close the loop
+				baseLat, baseLon := getTargetedTether(targetQ)
+
+				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+
+				mu.Lock()
+				entities[id] = &Entity{
+					ID:        id,
+					Type:      "RADAR",
+					Lat:       baseLat + (latNudge * precisionScale * 2.0),
+					Lon:       baseLon + (lonNudge * precisionScale * 2.0),
+					StartTime: simClock.Unix(), // Sync for Newborn Protection logic
+				}
+				kills[id] = 0
+
+				if budget >= RadarCost {
+					budget -= RadarCost
+				}
+				mu.Unlock()
 			}
+
 		case 2: // RELOCATE
+			// Relocation still uses general tethering to allow broad re-optimization
 			var worstID string
 			minK := 999999
 			for id, c := range kills {
-				if entities[id].Type == "RADAR" && c < minK {
+				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
 					minK = c
 					worstID = id
 				}
@@ -542,15 +945,17 @@ func runPhysicsEngine() {
 				budget -= RelocationCost
 			}
 		}
-		mu.Unlock()
 
-		// Vital breather for UI network stack
-		time.Sleep(2 * time.Millisecond)
+		// Limit real-world CPU spin; Sim progress is now controlled by simClock
+		time.Sleep(1 * time.Millisecond)
+		mu.Unlock()
 	}
 }
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// 1. POPULATE CITIES
 	cityData := map[string][]float64{
 		// Canada
 		"Toronto": {43.65, -79.38}, "Montreal": {45.50, -73.56}, "Vancouver": {49.28, -123.12},
@@ -638,9 +1043,16 @@ func main() {
 		entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
 		cityNames = append(cityNames, name)
 	}
-	setupSimulation()
 
-	// FORCED INITIALIZATION: Ensure the NN has assets to work with immediately.
+	// 2. INITIALIZE NEURAL NETWORK
+	// Use a small multiplier for initial weight scaling to prevent saturation
+	brain = NewBrain(mutationRate)
+
+	// 3. LOAD PERSISTENCE (Crucial for NN Persistence)
+	// We call this before seeding so we know if we actually need a new fleet
+	loadSystemState()
+
+	// 4. SEED FLEET (Only if no optimized fleet was loaded)
 	mu.Lock()
 	radarCount := 0
 	for _, e := range entities {
@@ -649,40 +1061,36 @@ func main() {
 		}
 	}
 	if radarCount < MinRadars {
-		fmt.Println("INITIALIZING SEED FLEET...")
+		fmt.Println("NO PERSISTENCE FOUND. INITIALIZING SEED FLEET...")
 		for i := 0; i < MinRadars; i++ {
 			id := fmt.Sprintf("R-START-%d", i)
 			lat, lon := getTetheredCoords()
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
 		}
+	} else {
+		fmt.Printf("RESUMING ERA %d WITH %d OPTIMIZED ASSETS\n", currentCycle, radarCount)
 	}
 	mu.Unlock()
-	wallStart = time.Now()
 
+	wallStart = time.Now()
 	go runPhysicsEngine()
 
+	// 5. HTTP HANDLERS
 	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
-
-		// 1. Clear everything first
 		entities = make(map[string]*Entity)
 		cityNames = []string{}
 		kills = make(map[string]int)
-
-		// 2. Re-populate cities fully BEFORE workers can resume
 		for name, pos := range cityData {
 			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
 			cityNames = append(cityNames, name)
 		}
-
-		// 3. Re-seed Radars
 		for i := 0; i < MinRadars; i++ {
 			id := fmt.Sprintf("R-START-%d", i)
 			lat, lon := getTetheredCoords()
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon}
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
 		}
-
 		forceReset = true
 		w.Write([]byte("Shield Re-initialized Successfully"))
 	})
@@ -705,27 +1113,26 @@ func main() {
 		for _, e := range entities {
 			all = append(all, *e)
 		}
+
+		// UPDATED: Added max_radars for the UI dashboard
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cycle":    currentCycle,
-			"budget":   budget,
-			"entities": all,
-			"success":  successRate,
-			"streak":   winStreakCounter,
-			"isOver":   isSimulationOver,
-			"yps":      yps,
+			"cycle":      currentCycle,
+			"budget":     budget,
+			"entities":   all,
+			"success":    successRate,
+			"streak":     winStreakCounter,
+			"isOver":     isSimulationOver,
+			"yps":        yps,
+			"max_radars": MaxRadars,
 		})
 	})
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
 	})
+
 	fmt.Println("AEGIS BENCHMARK RUNNING AT :8080")
 	http.ListenAndServe(":8080", nil)
-}
-
-func setupSimulation() {
-	brain = NewBrain(mutationRate) // Initialize graph first
-	loadSystemState()              // Overlay persistent data
 }
 
 const uiHTML = `
@@ -757,7 +1164,7 @@ const uiHTML = `
     <div class="stat-line">ERA: <span id="era" class="val">0</span></div>
     <div class="stat-line">FLEET: <span id="rcount" class="val">0</span> / <span id="maxr" class="highlight">0</span></div>
     <div class="stat-line">EFFICIENCY: <span id="success" class="val">0</span>%</div>
-    <div class="stat-line">WIN STREAK: <span id="streak" class="val highlight">0 / 1000</span></div>
+    <div class="stat-line">WIN STREAK: <span id="streak" class="val highlight">0 / 5000</span></div>
     <div class="stat-line">THROUGHPUT: <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET: <span id="budget" class="val" style="color:#fb0">$0</span></div>
     <button id="panic-btn" onclick="triggerPanic()">MANUAL SYSTEM RESET</button>
@@ -815,7 +1222,7 @@ const uiHTML = `
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
             document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
-            document.getElementById('streak').innerText = (data.streak || 0) + " / 200";
+            document.getElementById('streak').innerText = (data.streak || 0) + " / 5000";
 
             const now = Date.now();
             const currentIds = new Set();
@@ -828,21 +1235,34 @@ const uiHTML = `
 
                 if (!layers[e.id]) {
                     if (e.type === 'RADAR') {
-                        layers[e.id] = L.circle([e.lat, e.lon], { 
-                            radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1, interactive: false 
-                        }).addTo(map);
+                        layers[e.id] = L.circle([e.lat, e.lon], { radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1 }).addTo(map);
+                    } else if (e.type === 'SAT') {
+                        layers[e.id] = L.circle([e.lat, e.lon], { radius: 2500000, color: '#0af', weight: 1, fillOpacity: 0.05, dashArray: '5, 10' }).addTo(map);
                     } else {
-                        layers[e.id] = L.circleMarker([e.lat, e.lon], { 
-                            radius: 3, color: '#f44', fillOpacity: 0.7, interactive: false 
-                        }).addTo(map);
+                        layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7 }).addTo(map);
                     }
                 } else {
+                    // Update position
                     layers[e.id].setLatLng([e.lat, e.lon]);
-                    // Visual feedback for NN relocations
-                    if (e.last_moved && (now - e.last_moved < 1500)) {
-                        layers[e.id].setStyle({color: '#ff0', weight: 4, fillOpacity: 0.5});
-                    } else if (e.type === 'RADAR') {
-                        layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
+
+                    // MOVEMENT VISUAL FEEDBACK
+                    // If moved in last 1.5 seconds, flash yellow to show NN activity
+                    const movedRecently = e.last_moved && (now - e.last_moved < 1500);
+                    
+                    if (movedRecently) {
+                        layers[e.id].setStyle({
+                            color: '#ff0', 
+                            weight: 6, // Thicker border
+                            fillOpacity: 0.4,
+                            dashArray: null // Solid line during move
+                        });
+                    } else {
+                        // Revert to standard styling
+                        if (e.type === 'RADAR') {
+                            layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1});
+                        } else if (e.type === 'SAT') {
+                            layers[e.id].setStyle({color: '#0af', weight: 1, fillOpacity: 0.05, dashArray: '5, 10'});
+                        }
                     }
                 }
             });
