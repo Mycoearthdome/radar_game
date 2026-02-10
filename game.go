@@ -1421,5 +1421,5 @@ const uiHTML = `
         isFetching = false;
     }
     
-    setInterval(updateUI, 100); // 10Hz Refresh rate
+    setInterval(updateUI, 600); // 60Hz Refresh rate
 </script></body></html>`
