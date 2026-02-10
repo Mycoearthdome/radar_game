@@ -187,28 +187,36 @@ func getGridID(lat, lon float64) int {
 	return row*Cols + col
 }
 
-func NewBrain(multiplier float64) *Brain {
+func NewBrain() *Brain {
 	g := gorgonia.NewGraph()
+
+	// 1. Define Inputs, Weights, and Target
 	x := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 18), gorgonia.WithName("x"))
+	targetSignal := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 3), gorgonia.WithName("target_signal"))
 
-	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(18, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
-	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(24, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(multiplier)))
+	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(18, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
+	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(24, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
 
-	// Forward Pass
+	// 2. Define the Forward Pass (Unify into one path)
+	// We use LeakyRelu for hidden layers to prevent "dying neurons"
+	// and Tanh for the output to get that [-1, 1] range for actions.
 	h0 := gorgonia.Must(gorgonia.Mul(x, w0))
 	a0 := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.1))
 	h1 := gorgonia.Must(gorgonia.Mul(a0, w1))
 	out := gorgonia.Must(gorgonia.Tanh(h1))
 
-	// --- TARGET NODE ---
-	// Instead of 'actual', we define a 'target_signal' node.
-	// If the simulation was successful, we nudge 'out' toward 1.0 (Stay/Build).
-	// If it failed, we nudge it toward -1.0 (Move).
-	targetSignal := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 3), gorgonia.WithName("target_signal"))
+	//
 
-	// --- THE DIFFERENTIABLE COST ---
+	// 3. Define the Differentiable Cost
 	// This connects 'out' (and thus w0/w1) to the error calculation.
 	cost := gorgonia.Must(gorgonia.Mean(gorgonia.Must(gorgonia.Square(gorgonia.Must(gorgonia.Sub(targetSignal, out))))))
+
+	// 4. Register Gradients (Crucial for the solver to avoid nil pointer panics)
+	if _, err := gorgonia.Grad(cost, w0, w1); err != nil {
+		panic(err)
+	}
+
+	//
 
 	solver := gorgonia.NewVanillaSolver(gorgonia.WithLearnRate(0.01), gorgonia.WithClip(5.0))
 
@@ -218,7 +226,7 @@ func NewBrain(multiplier float64) *Brain {
 		w1:     w1,
 		x:      x,
 		out:    out,
-		target: targetSignal, // We'll bind the 'ideal' action here
+		target: targetSignal,
 		cost:   cost,
 		solver: solver,
 	}
@@ -256,37 +264,43 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 		return 0, 0, 0
 	}
 
-	// Lazy init the VM if it doesn't exist
-	if b.vm == nil {
-		b.vm = gorgonia.NewTapeMachine(b.g, gorgonia.BindDualValues(b.w0, b.w1))
-	}
-
-	// Bind inputs safely
+	// 1. Bind inputs to the 'x' node
 	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
 	if err := gorgonia.Let(b.x, inputT); err != nil {
 		return 0, 0, 0
 	}
 
-	// RUN THE VM
-	if err := b.vm.RunAll(); err != nil {
-		fmt.Printf("[ERROR] VM Execution failed: %v\n", err)
+	// 2. IMPORTANT: We only execute the subgraph required for 'out'
+	// This ignores target_signal and cost nodes entirely.
+	prog, locs, err := gorgonia.Compile(b.g)
+	if err != nil {
+		panic(err)
+	}
+
+	// We use a local TapeMachine to avoid state conflicts with the Training VM
+	vm := gorgonia.NewTapeMachine(b.g, gorgonia.WithPrecompiled(prog, locs))
+
+	// 3. RUN ONLY THE OUTPUT PATH
+	// Use RunInstruction to target just the output, or bind a dummy to target_signal
+	// If you want to use the simpler 'RunAll', you MUST bind a dummy to target:
+	dummyTarget := tensor.New(tensor.WithShape(1, 3), tensor.WithBacking([]float64{0, 0, 0}))
+	gorgonia.Let(b.target, dummyTarget)
+
+	if err := vm.RunAll(); err != nil {
+		fmt.Printf("[ERROR] Prediction failed: %v\n", err)
+		vm.Close()
 		return 0, 0, 0
 	}
 
-	// Reset MUST happen after RunAll but before the next call
-	defer b.vm.Reset()
-
-	val := b.out.Value()
-	if val == nil {
-		return 0, 0, 0
-	}
-	res := val.Data().([]float64)
+	// 4. Extract data and close
+	res := b.out.Value().Data().([]float64)
+	vm.Close()
 
 	action := 0
 	if res[0] > 0.1 {
-		action = 1
+		action = 1 // STAY
 	} else if res[0] < -0.1 {
-		action = 2
+		action = 2 // MOVE
 	}
 	return action, res[1], res[2]
 }
@@ -932,88 +946,96 @@ func runPhysicsEngine() {
 		// NN Prediction & Actions
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
 
-		input := getBrainInputs(nil, rCount, budget, successRate, quadrantRadars, satCount, dayProgress)
-
-		action, latN, lonN := brain.PredictSpatial(input)
-
-		// --- KICKSTART LOGIC ---CHEAT
-		// If we haven't moved in 100 eras and success is low, force an action
-		if successRate <= 50.0 && rand.Float64() < 0.05 {
-			if rCount < MaxRadars {
-				action = 1 // Force Build
-			} else {
-				action = 2 // Force Relocate
-			}
-		}
-
-		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
-
-		canAffordBuild := budget >= RadarCost || successRate < 90.0
-		canAffordMove := budget >= RelocationCost || successRate < 90.0
-
-		if action == 1 && canAffordBuild {
-			tQ := 0
-			maxM := -1.0
-			for i, m := range quadrantMisses {
-				if m > maxM {
-					maxM = m
-					tQ = i
-				}
-			}
-			bLat, bLon := getTargetedTether(tQ)
-			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
-			kills[id] = 0
-			if budget >= RadarCost {
-				budget -= RadarCost
+		for _, e := range entities {
+			if e.Type != "RADAR" {
+				continue
 			}
 
-		} else if action == 2 && canAffordMove {
-			var worstID string
-			minK := 999999
+			// Get specific context for this radar [cite: 2026-02-08]
+			input := getBrainInputs(e, rCount, budget, successRate, quadrantRadars, satCount, dayProgress)
 
-			// 1. Identify the most "Useless" Radar
-			for id, c := range kills {
-				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
-					minK = c
-					worstID = id
-				}
-			}
+			// action is an int (0, 1, or 2)
+			action, latN, lonN := brain.PredictSpatial(input)
 
-			if e, ok := entities[worstID]; ok {
-				// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
-				targetQ := 0
-				maxMiss := -1.0
+			// --- KICKSTART LOGIC ---CHEAT
+			// If we haven't moved in 100 eras and success is low, force an action
+			//if successRate <= 50.0 && rand.Float64() < 0.05 {
+			//	if rCount < MaxRadars {
+			//		action = 1 // Force Build
+			//	} else {
+			//		action = 2 // Force Relocate
+			//	}
+			//}
+
+			prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
+
+			canAffordBuild := budget >= RadarCost || successRate < 90.0
+			canAffordMove := budget >= RelocationCost || successRate < 90.0
+
+			if action == 1 && canAffordBuild {
+				tQ := 0
+				maxM := -1.0
 				for i, m := range quadrantMisses {
-					if m > maxMiss {
-						maxMiss = m
-						targetQ = i
+					if m > maxM {
+						maxM = m
+						tQ = i
+					}
+				}
+				bLat, bLon := getTargetedTether(tQ)
+				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
+				kills[id] = 0
+				if budget >= RadarCost {
+					budget -= RadarCost
+				}
+
+			} else if action == 2 && canAffordMove {
+				var worstID string
+				minK := 999999
+
+				// 1. Identify the most "Useless" Radar
+				for id, c := range kills {
+					if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
+						minK = c
+						worstID = id
 					}
 				}
 
-				// 3. TARGETED LEAP: Get a base position in that specific quadrant
-				// Instead of e.Lat = e.Lat + nudge, we do:
-				bLat, bLon := getTargetedTether(targetQ)
+				if e, ok := entities[worstID]; ok {
+					// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
+					targetQ := 0
+					maxMiss := -1.0
+					for i, m := range quadrantMisses {
+						if m > maxMiss {
+							maxMiss = m
+							targetQ = i
+						}
+					}
 
-				// 4. APPLY POSITION: Leap to the city, then use NN nudge for local offset
-				// precision here should be around 50-100km to spread them out around the city
-				e.Lat = bLat + (latN * 50.0 / 111.0) // 111km per degree approx
-				e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
+					// 3. TARGETED LEAP: Get a base position in that specific quadrant
+					// Instead of e.Lat = e.Lat + nudge, we do:
+					bLat, bLon := getTargetedTether(targetQ)
 
-				e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
-				kills[worstID] = 0                   // Reset performance for the new era
+					// 4. APPLY POSITION: Leap to the city, then use NN nudge for local offset
+					// precision here should be around 50-100km to spread them out around the city
+					e.Lat = bLat + (latN * 50.0 / 111.0) // 111km per degree approx
+					e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
 
-				e.LastMoved = time.Now().UnixMilli()
+					e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
+					kills[worstID] = 0                   // Reset performance for the new era
 
-				if budget >= RelocationCost {
-					budget -= RelocationCost
+					e.LastMoved = time.Now().UnixMilli()
+
+					if budget >= RelocationCost {
+						budget -= RelocationCost
+					}
+					fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
 				}
-				fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
 			}
 		}
 		simClock = simClock.Add(TimeStepping)
 		//runtime.Gosched()                // CRITICAL: Gives the web server/UI a window to get the lock
-		time.Sleep(1 * time.Millisecond) // Prevents 100% CPU lock
+		time.Sleep(10 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
 
@@ -1111,7 +1133,7 @@ func main() {
 
 	// 2. INITIALIZE NEURAL NETWORK
 	// Use a small multiplier for initial weight scaling to prevent saturation
-	brain = NewBrain(mutationRate)
+	brain = NewBrain()
 
 	// 3. LOAD PERSISTENCE (Crucial for NN Persistence)
 	// We call this before seeding so we know if we actually need a new fleet
