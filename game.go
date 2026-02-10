@@ -945,8 +945,8 @@ func runPhysicsEngine() {
 
 		// NN Prediction & Actions
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
-
-		for _, e := range entities {
+		entities_clone := entities
+		for _, e := range entities_clone {
 			if e.Type != "RADAR" {
 				continue
 			}
@@ -969,8 +969,8 @@ func runPhysicsEngine() {
 
 			prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
 
-			canAffordBuild := budget >= RadarCost || successRate < 90.0
-			canAffordMove := budget >= RelocationCost || successRate < 90.0
+			canAffordBuild := (rCount < MaxRadars) && (budget >= RadarCost)
+			canAffordMove := budget >= RelocationCost
 
 			if action == 1 && canAffordBuild {
 				tQ := 0
@@ -988,7 +988,7 @@ func runPhysicsEngine() {
 				if budget >= RadarCost {
 					budget -= RadarCost
 				}
-
+				rCount = rCount + 1
 			} else if action == 2 && canAffordMove {
 				var worstID string
 				minK := 999999
