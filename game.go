@@ -32,10 +32,10 @@ const (
 	TimeStepping        = 20 * time.Minute
 	RadarFile           = "RADAR.json"
 	BrainFile           = "BRAIN.gob"
-	BankruptcyLimit     = StartBudget / 2 //50%
-	GridSize            = 10              // 10 degree cells
-	Cols                = 36              // 360 / 10
-	Rows                = 18              // 180 / 10
+	BankruptcyLimit     = 0.0
+	GridSize            = 10 // 10 degree cells
+	Cols                = 36 // 360 / 10
+	Rows                = 18 // 180 / 10
 	TargetSuccess       = 100.0
 	RequiredWinStreak   = 5000   // Number of eras to maintain 100% before "winning"
 	MissileMaxSpeedKMH  = 8000.0 // Hypersonic Mach 6.5+
@@ -51,8 +51,8 @@ const (
 	LaunchInterval      = 1 * 24 * 31 * time.Hour //one month
 	MissileMaxRangeKM   = 2500.0                  // The absolute maximum distance a missile can travel
 	FuelConsumption     = 0.04                    // Energy/Fuel cost per KM traveled by the threat
-	StartBudget         = 500000000000.0
-	EmergencyBudget     = StartBudget / 2
+	StartBudget         = 1000000000.0
+	EmergencyBudget     = StartBudget
 )
 
 var (
@@ -495,7 +495,7 @@ func autonomousEraReset() {
 	}
 
 	// 5. CRISIS RECOVERY
-	if budget < -BankruptcyLimit || (rCount < MinRadars && budget < RadarCost) {
+	if budget < BankruptcyLimit || (rCount < MinRadars && budget < RadarCost) {
 		fmt.Println("\nCRISIS: Adaptive Mutation Triggered...")
 		brain.AdaptiveMutate(successRate)
 		budget = EmergencyBudget // Emergency Capital Injection
@@ -674,8 +674,6 @@ func getTargetedTether(quadrant int) (float64, float64) {
 
 func runPhysicsEngine() {
 	var lastLaunch time.Time
-
-	// Ensure initialization
 	mu.Lock()
 	if simClock.IsZero() {
 		simClock = time.Now()
@@ -684,297 +682,232 @@ func runPhysicsEngine() {
 	mu.Unlock()
 
 	for {
-		// 1. ERA BOUNDARY CHECK & RESET
 		mu.Lock()
-		// Check if the next step would overshoot the Era duration
 		if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 			forceReset = false
 			mu.Unlock()
 			autonomousEraReset()
 			continue
 		}
-		mu.Unlock()
 
-		// 2. SATELLITE CONSTELLATION MANAGEMENT
-		mu.Lock()
+		// Update Satellites
 		satCount := 0
 		for _, e := range entities {
 			if e.Type == "SAT" {
 				satCount++
 			}
 		}
-
 		if satCount < MaxSatellites && simClock.Sub(lastLaunch) >= LaunchInterval {
 			site := launchSites[rand.Intn(len(launchSites))]
 			id := fmt.Sprintf("SAT-%d-%d", currentCycle, satCount)
-			entities[id] = &Entity{
-				ID: id, Type: "SAT",
-				LaunchLat: site.Lat, LaunchLon: site.Lon,
-				Lat: site.Lat, Lon: site.Lon,
-				StartTime: simClock.Unix(),
-			}
+			entities[id] = &Entity{ID: id, Type: "SAT", LaunchLat: site.Lat, LaunchLon: site.Lon, Lat: site.Lat, Lon: site.Lon, StartTime: simClock.Unix()}
 			lastLaunch = simClock
 		}
-
-		// Update Orbital Positions based on the decoupled simClock
 		for _, e := range entities {
 			if e.Type == "SAT" {
 				e.Lat, e.Lon = getSatellitePos(e.StartTime, e.LaunchLat, e.LaunchLon, simClock)
 			}
 		}
-		mu.Unlock()
 
-		// 3. SPATIAL INDEXING
-		mu.Lock()
+		// Snapshot for Lock-Free Simulation
+		type EntityVal struct {
+			ID, Type string
+			Lat, Lon float64
+		}
+		snap := make(map[string]EntityVal)
 		spatialIndex := make(map[int][]string)
 		cityIndex := make(map[int][]string)
 		quadrantRadars := make([]float64, 4)
 		rCount := 0
 
 		for id, e := range entities {
+			snap[id] = EntityVal{ID: e.ID, Type: e.Type, Lat: e.Lat, Lon: e.Lon}
 			gID := getGridID(e.Lat, e.Lon)
-			switch e.Type {
-			case "RADAR":
+			if e.Type == "RADAR" {
 				spatialIndex[gID] = append(spatialIndex[gID], id)
 				rCount++
-				qIdx := 0
+				idx := 0
 				if e.Lat < 0 {
-					qIdx += 2
+					idx += 2
 				}
 				if e.Lon > 0 {
-					qIdx += 1
+					idx += 1
 				}
-				quadrantRadars[qIdx]++
-			case "SAT":
+				quadrantRadars[idx]++
+			} else if e.Type == "SAT" {
 				spatialIndex[gID] = append(spatialIndex[gID], id)
-			case "CITY":
+			} else if e.Type == "CITY" {
 				cityIndex[gID] = append(cityIndex[gID], id)
 			}
 		}
+		snapBudget, snapSuccess := budget, successRate
 		mu.Unlock()
 
-		// 4. MULTI-THREADED THREAT SIMULATION
+		// Worker Pool
 		var wg sync.WaitGroup
 		numWorkers := runtime.NumCPU()
-		batchSize := numWorkers
+		batchSize := 200
+		workerKills := make(chan map[string]int, numWorkers)
+		workerStats := make(chan struct {
+			ints, thrs int
+			rew, pen   float64
+			misses     []float64
+		}, numWorkers)
 
 		for w := 0; w < numWorkers; w++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				localKills := make(map[string]int)
-				localMisses := make([]float64, 4)
-				lInt, lThr, lRew, lPen := 0, 0, 0.0, 0.0
-
+				lKills := make(map[string]int)
+				lMisses := make([]float64, 4)
+				li, lt, lr, lp := 0, 0, 0.0, 0.0
 				for i := 0; i < batchSize/numWorkers; i++ {
-					spawnLat := (rand.Float64() * 180.0) - 90.0
-					spawnLon := (rand.Float64() * 360.0) - 180.0
-					spawnGrid := getGridID(spawnLat, spawnLon)
-
-					var targetCity *Entity
-					mu.RLock()
+					sLat, sLon := (rand.Float64()*180.0)-90.0, (rand.Float64()*360.0)-180.0
+					gridID := getGridID(sLat, sLon)
+					var targetCity EntityVal
+					foundCity := false
 				citySearch:
 					for r := -3; r <= 3; r++ {
 						for c := -3; c <= 3; c++ {
-							checkID := spawnGrid + (r * Cols) + c
-							for _, cityName := range cityIndex[checkID] {
-								// DEFENSIVE: Verify city still exists in map
-								city, exists := entities[cityName]
-								if exists && city != nil {
-									if getDistanceKM(spawnLat, spawnLon, city.Lat, city.Lon) < MissileMaxRangeKM {
-										targetCity = city
+							if names, ok := cityIndex[gridID+(r*Cols)+c]; ok {
+								for _, n := range names {
+									if getDistanceKM(sLat, sLon, snap[n].Lat, snap[n].Lon) < MissileMaxRangeKM {
+										targetCity, foundCity = snap[n], true
 										break citySearch
 									}
 								}
 							}
 						}
 					}
-					mu.RUnlock()
-
-					if targetCity == nil {
+					if !foundCity {
 						continue
 					}
-
 					intercepted := false
-					mu.RLock()
-					targetGrid := getGridID(targetCity.Lat, targetCity.Lon)
-				outerBreak:
+					tGrid := getGridID(targetCity.Lat, targetCity.Lon)
+				outer:
 					for r := -2; r <= 2; r++ {
 						for c := -2; c <= 2; c++ {
-							checkID := targetGrid + (r * Cols) + c
-							for _, sensorID := range spatialIndex[checkID] {
-								// DEFENSIVE: Verify sensor still exists
-								sensor, exists := entities[sensorID]
-								if !exists || sensor == nil {
-									continue
-								}
-
-								rangeLimit := RadarRadiusKM
-								if sensor.Type == "SAT" {
-									rangeLimit = SatelliteRangeKM
-								}
-
-								if getDistanceKM(sensor.Lat, sensor.Lon, targetCity.Lat, targetCity.Lon) < rangeLimit {
-									// DEFENSIVE: Final check before physics calculation
-									if simulateHomingIntercept(sensor, targetCity, spawnLat, spawnLon) {
-										localKills[sensorID]++
-										lInt++
-										lRew += InterceptReward
-										intercepted = true
-										break outerBreak
+							if sids, ok := spatialIndex[tGrid+(r*Cols)+c]; ok {
+								for _, sid := range sids {
+									sensor := snap[sid]
+									rng := RadarRadiusKM
+									if sensor.Type == "SAT" {
+										rng = SatelliteRangeKM
+									}
+									if getDistanceKM(sensor.Lat, sensor.Lon, targetCity.Lat, targetCity.Lon) < rng {
+										if simulateHomingIntercept(&Entity{ID: sensor.ID, Type: sensor.Type, Lat: sensor.Lat, Lon: sensor.Lon}, &Entity{Lat: targetCity.Lat, Lon: targetCity.Lon}, sLat, sLon) {
+											lKills[sid]++
+											li++
+											lr += InterceptReward
+											intercepted = true
+											break outer
+										}
 									}
 								}
 							}
 						}
 					}
-					mu.RUnlock()
-
 					if !intercepted {
-						lThr++
-						lPen += CityImpactPenalty
-						qIdx := 0
+						lt++
+						// FIX: DYNAMIC PENALTY (Prevents the "Crisis Loop")
+						p := CityImpactPenalty
+						if snapSuccess < 85.0 {
+							p *= 0.05
+						} // 95% discount while learning
+						lp += p
+						idx := 0
 						if targetCity.Lat < 0 {
-							qIdx += 2
+							idx += 2
 						}
 						if targetCity.Lon > 0 {
-							qIdx += 1
+							idx += 1
 						}
-						localMisses[qIdx]++
+						lMisses[idx]++
 					}
 				}
-
-				// Sync local worker results to global state
-				mu.Lock()
-				for id, count := range localKills {
-					if _, exists := kills[id]; exists {
-						kills[id] += count
-					}
-				}
-				for i, val := range localMisses {
-					quadrantMisses[i] += val
-				}
-				totalIntercepts += lInt
-				totalThreats += lThr
-				budget += (lRew - lPen)
-				mu.Unlock()
+				workerKills <- lKills
+				workerStats <- struct {
+					ints, thrs int
+					rew, pen   float64
+					misses     []float64
+				}{li, lt, lr, lp, lMisses}
 			}()
 		}
-		wg.Wait()
 
-		// 5. AI STRATEGY & DYNAMIC TEMPORAL STEP
+		go func() { wg.Wait(); close(workerKills); close(workerStats) }()
+
 		mu.Lock()
-
-		// Fix #2: Advance simClock by a fixed step, but snap to Era boundary
-		simTimeStep := TimeStepping
-		simClock = simClock.Add(simTimeStep)
-
-		// Decay past misses to prevent the AI from over-reacting to old data
-		for i := range quadrantMisses {
-			quadrantMisses[i] *= 0.90
+		for lk := range workerKills {
+			for id, count := range lk {
+				if _, ok := kills[id]; ok {
+					kills[id] += count
+				}
+			}
+		}
+		for ls := range workerStats {
+			totalIntercepts += ls.ints
+			totalThreats += ls.thrs
+			budget += (ls.rew - ls.pen)
+			for i, v := range ls.misses {
+				quadrantMisses[i] += v
+			}
 		}
 
+		simClock = simClock.Add(TimeStepping)
 		if totalThreats+totalIntercepts > 0 {
 			successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 		}
 
-		// 1. Calculate Spatial Density (Current distribution of assets)
-		// quadrantRadars is already calculated in Section 3 of your loop
-
-		// 2. Temporal Awareness: Mapping the 24h cycle to a unit circle
-		// This helps the NN learn the "rhythm" of your satellite orbits
-		elapsed := simClock.Sub(eraStartTime).Seconds()
-		dayProgress := elapsed / EraDuration.Seconds()
-		timeSin := math.Sin(2 * math.Pi * dayProgress)
-		timeCos := math.Cos(2 * math.Pi * dayProgress)
-
-		// 3. Efficiency Trend (Is defense improving or failing?)
-		// Note: lastEraSuccess is updated in autonomousEraReset
-		trend := (successRate - lastEraSuccess) / 100.0
-
-		// 4. Construct the 16-Node Input Vector
-		// We normalize all values between -1.0 and 1.0 to keep the Brain stable
+		// NN Prediction & Actions
+		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
 		input := []float64{
-			math.Max(-1, math.Min(budget/1e9, 1.0)),    // 0: Budget (Normalized to Billions)
-			float64(rCount) / float64(MaxRadars),       // 1: Radar Fleet Load
-			successRate / 100.0,                        // 2: Efficiency (0.0 to 1.0)
-			math.Min(quadrantMisses[0]/500.0, 1.0),     // 3: Q1 Weighted Misses
-			math.Min(quadrantMisses[1]/500.0, 1.0),     // 4: Q2
-			math.Min(quadrantMisses[2]/500.0, 1.0),     // 5: Q3
-			math.Min(quadrantMisses[3]/500.0, 1.0),     // 6: Q4
-			float64(satCount) / float64(MaxSatellites), // 7: Satellite Fleet Load
-			math.Min(quadrantRadars[0]/20.0, 1.0),      // 8: Q1 Radar Density
-			math.Min(quadrantRadars[1]/20.0, 1.0),      // 9: Q2
-			math.Min(quadrantRadars[2]/20.0, 1.0),      // 10: Q3
-			math.Min(quadrantRadars[3]/20.0, 1.0),      // 11: Q4
-			math.Max(-1.0, math.Min(trend, 1.0)),       // 12: Success Trend
-			difficultyMultiplier / 10.0,                // 13: Relative Threat Speed
-			timeSin,                                    // 14: Temporal Pulse (Sin)
-			timeCos,                                    // 15: Temporal Pulse (Cos)
+			math.Max(-1, math.Min(snapBudget/1e9, 1.0)), float64(rCount) / float64(MaxRadars),
+			snapSuccess / 100.0, math.Min(quadrantMisses[0]/500.0, 1.0), math.Min(quadrantMisses[1]/500.0, 1.0),
+			math.Min(quadrantMisses[2]/500.0, 1.0), math.Min(quadrantMisses[3]/500.0, 1.0),
+			float64(satCount) / float64(MaxSatellites), math.Min(quadrantRadars[0]/20.0, 1.0),
+			math.Min(quadrantRadars[1]/20.0, 1.0), math.Min(quadrantRadars[2]/20.0, 1.0),
+			math.Min(quadrantRadars[3]/20.0, 1.0), (successRate - lastEraSuccess) / 100.0,
+			difficultyMultiplier / 10.0, math.Sin(2 * math.Pi * dayProgress), math.Cos(2 * math.Pi * dayProgress),
 		}
 
-		action, latNudge, lonNudge := brain.PredictSpatial(input)
-		precisionScale := 20.0 * (1.0 - (successRate / 100.0))
-		if precisionScale < 5.0 {
-			precisionScale = 5.0
-		}
-
-		switch action {
-		case 1: // BUILD
-			if (budget >= RadarCost || rCount < MinRadars) && rCount < MaxRadars {
-				// 1. Identify the "Hot Zone" (quadrant with the most recent misses)
-				targetQ := 0
-				maxM := -1.0
-				for i, m := range quadrantMisses {
-					if m > maxM {
-						maxM = m
-						targetQ = i
-					}
+		action, latN, lonN := brain.PredictSpatial(input)
+		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
+		if action == 1 && rCount < MaxRadars {
+			tQ := 0
+			maxM := -1.0
+			for i, m := range quadrantMisses {
+				if m > maxM {
+					maxM = m
+					tQ = i
 				}
-
-				// 2. Get coords specifically in that quadrant to close the loop
-				baseLat, baseLon := getTargetedTether(targetQ)
-
-				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-
-				mu.Lock()
-				entities[id] = &Entity{
-					ID:        id,
-					Type:      "RADAR",
-					Lat:       baseLat + (latNudge * precisionScale * 2.0),
-					Lon:       baseLon + (lonNudge * precisionScale * 2.0),
-					StartTime: simClock.Unix(), // Sync for Newborn Protection logic
-				}
-				kills[id] = 0
-
-				if budget >= RadarCost {
-					budget -= RadarCost
-				}
-				mu.Unlock()
 			}
-
-		case 2: // RELOCATE
-			// Relocation still uses general tethering to allow broad re-optimization
-			var worstID string
+			bLat, bLon := getTargetedTether(tQ)
+			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
+			kills[id] = 0
+			if budget >= RadarCost {
+				budget -= RadarCost
+			}
+		} else if action == 2 && budget >= RelocationCost {
+			var wID string
 			minK := 999999
 			for id, c := range kills {
 				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
 					minK = c
-					worstID = id
+					wID = id
 				}
 			}
-			if e, ok := entities[worstID]; ok && budget >= RelocationCost {
-				bLat, bLon := getTetheredCoords()
-				e.Lat = bLat + (latNudge * precisionScale)
-				e.Lon = bLon + (lonNudge * precisionScale)
+			if e, ok := entities[wID]; ok {
+				bL, bO := getTetheredCoords()
+				e.Lat, e.Lon = bL+(latN*prec), bO+(lonN*prec)
 				e.LastMoved = time.Now().UnixMilli()
-				kills[worstID] = 0
+				kills[wID] = 0
 				budget -= RelocationCost
 			}
 		}
-
-		// Limit real-world CPU spin; Sim progress is now controlled by simClock
-		time.Sleep(1 * time.Millisecond)
 		mu.Unlock()
+		runtime.Gosched()
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
