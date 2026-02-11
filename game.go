@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"gorgonia.org/gorgonia"
+	"gorgonia.org/gorgonia/cuda"
 	"gorgonia.org/tensor"
 )
 
@@ -84,6 +85,8 @@ var (
 	EfficiencyBonus      = 100000.0
 	difficultyMultiplier = 1.0
 	ctx, cancel          = context.WithCancel(context.Background())
+	activeRadars         []*Entity
+	batchInputs          [][]float64
 )
 
 var launchSites = []struct{ Lat, Lon float64 }{
@@ -120,9 +123,8 @@ type Brain struct {
 	x   *gorgonia.Node
 	out *gorgonia.Node
 
-	target *gorgonia.Node
-	actual *gorgonia.Node
-	cost   *gorgonia.Node
+	targetSignal *gorgonia.Node
+	cost         *gorgonia.Node
 
 	vm     gorgonia.VM
 	solver gorgonia.Solver
@@ -195,73 +197,74 @@ func getGridID(lat, lon float64) int {
 func NewBrain() *Brain {
 	g := gorgonia.NewGraph()
 
-	// 1. Define Inputs, Weights, and Target
+	// 1. Setup Nodes
 	x := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 18), gorgonia.WithName("x"))
-	targetSignal := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 3), gorgonia.WithName("target_signal"))
+	targetSignal := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 3), gorgonia.WithName("target"))
 
+	// Weights
 	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(18, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
 	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(24, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
 
-	// 2. Define the Forward Pass (Unify into one path)
-	// We use LeakyRelu for hidden layers to prevent "dying neurons"
-	// and Tanh for the output to get that [-1, 1] range for actions.
+	// 2. Forward Pass
 	h0 := gorgonia.Must(gorgonia.Mul(x, w0))
 	a0 := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.1))
 	h1 := gorgonia.Must(gorgonia.Mul(a0, w1))
 	out := gorgonia.Must(gorgonia.Tanh(h1))
 
-	//
-
-	// 3. Define the Differentiable Cost
-	// This connects 'out' (and thus w0/w1) to the error calculation.
+	// 3. Loss & Gradients
 	cost := gorgonia.Must(gorgonia.Mean(gorgonia.Must(gorgonia.Square(gorgonia.Must(gorgonia.Sub(targetSignal, out))))))
 
-	// 4. Register Gradients (Crucial for the solver to avoid nil pointer panics)
+	// Pre-compile gradients for the solver
 	if _, err := gorgonia.Grad(cost, w0, w1); err != nil {
 		panic(err)
 	}
 
-	//
-
-	solver := gorgonia.NewVanillaSolver(gorgonia.WithLearnRate(0.01), gorgonia.WithClip(5.0))
+	// 4. CUDA Initialization
+	// We use device 0 (your primary GPU).
+	// WithBindDualTree() allows the VM to manage both CPU/GPU memory sync.
+	machine := cuda.NewCUDAMachine(g, gorgonia.WithDevice(0), gorgonia.BindDualTree())
 
 	return &Brain{
-		g:      g,
-		w0:     w0,
-		w1:     w1,
-		x:      x,
-		out:    out,
-		target: targetSignal,
-		cost:   cost,
-		solver: solver,
+		g:            g,
+		w0:           w0,
+		w1:           w1,
+		x:            x,
+		out:          out,
+		targetSignal: targetSignal,
+		cost:         cost,
+		vm:           machine,
+		solver:       gorgonia.NewVanillaSolver(gorgonia.WithLearnRate(0.01), gorgonia.WithClip(5.0)),
 	}
 }
 
 func (b *Brain) Train(inputs []float64, idealAction []float64) {
-	// 1. Bind the state the radar was in
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// 1. Bind the state
 	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
 	gorgonia.Let(b.x, inputT)
 
-	// 2. Bind the "Ideal" outcome (e.g., [1, 0, 0] for 'Stay' if it intercepted)
+	// 2. Bind the "Ideal" outcome
 	targetT := tensor.New(tensor.WithShape(1, 3), tensor.WithBacking(idealAction))
-	gorgonia.Let(b.target, targetT)
+	gorgonia.Let(b.targetSignal, targetT) // Use the field name from your struct
 
-	if b.vm == nil {
-		b.vm = gorgonia.NewTapeMachine(b.g, gorgonia.BindDualValues(b.w0, b.w1))
-	}
-
+	// 3. Execution
+	// Note: b.vm should already be a CUDAMachine from your NewBrain()
 	if err := b.vm.RunAll(); err != nil {
-		return
-	}
-	defer b.vm.Reset()
-
-	// 3. This will now work because 'cost' is linked to 'w0' and 'w1' via 'out'
-	if _, err := gorgonia.Grad(b.cost, b.w0, b.w1); err != nil {
+		log.Printf("CUDA Train Error: %v", err)
 		return
 	}
 
+	// 4. Update Weights
+	// CUDAMachine handles the gradient calculations on the GPU
 	targets := []gorgonia.ValueGrad{b.w0, b.w1}
-	b.solver.Step(targets)
+	if err := b.solver.Step(targets); err != nil {
+		log.Printf("Solver Error: %v", err)
+	}
+
+	// Reset for next pass
+	b.vm.Reset()
 }
 
 func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
@@ -269,32 +272,37 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 		return 0, 0, 0
 	}
 
-	// USE THE BRAIN'S LOCK, NOT THE GLOBAL MAP LOCK
-	// This prevents the training loop from touching the tensors
-	// while the VM is reading them.
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// 1. Prepare Input
 	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
 	gorgonia.Let(b.x, inputT)
 
-	mu.Lock()
+	// 2. Run GPU Inference
 	if err := b.vm.RunAll(); err != nil {
 		return 0, 0, 0
 	}
-	mu.Unlock()
-
-	// We must Reset BEFORE we release the lock
 	defer b.vm.Reset()
 
-	// CRITICAL SAFETY CHECK: Ensure the value exists before calling .Data()
+	// 3. TRANSFER TO HOST (Crucial for CUDA)
+	// If using CUDAMachine, we must pull the result from VRAM to RAM
+	if machine, ok := b.vm.(gorgonia.CUDAMachine); ok {
+		machine.TransferToHost(b.out)
+	}
+
+	// 4. Safely extract data
 	val := b.out.Value()
 	if val == nil {
 		return 0, 0, 0
 	}
 
-	res := val.Data().([]float64)
+	res, ok := val.Data().([]float64)
+	if !ok || len(res) < 3 {
+		return 0, 0, 0
+	}
 
+	// Action Logic: 0=Stay, 1=Build/Reinforce, 2=Relocate
 	action := 0
 	if res[0] > 0.1 {
 		action = 1
@@ -303,6 +311,57 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 	}
 
 	return action, res[1], res[2]
+}
+
+// reshapeOutput converts a flat slice of float64s into a 2D matrix
+// with the specified number of rows and 3 columns.
+func reshapeOutput(flatData []float64, rows int) [][]float64 {
+	// The number of columns is fixed by your NN architecture (3)
+	const cols = 3
+
+	// Create the outer slice (rows)
+	matrix := make([][]float64, rows)
+
+	for i := 0; i < rows; i++ {
+		// Create the inner slice (columns)
+		matrix[i] = make([]float64, cols)
+
+		// Copy the data for this row from the flat slice
+		start := i * cols
+		end := start + cols
+		copy(matrix[i], flatData[start:end])
+	}
+
+	return matrix
+}
+
+func (b *Brain) PredictBatch(radarInputs [][]float64) ([][]float64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// 1. Flatten the batch [N, 18] into a single [N*18] slice
+	flatInputs := make([]float64, 0, len(radarInputs)*18)
+	for _, input := range radarInputs {
+		flatInputs = append(flatInputs, input...)
+	}
+
+	// 2. Load into Gorgonia Tensor
+	batchT := tensor.New(tensor.WithShape(len(radarInputs), 18), tensor.WithBacking(flatInputs))
+	gorgonia.Let(b.x, batchT)
+
+	// 3. Run parallel execution on GPU
+	if err := b.vm.RunAll(); err != nil {
+		return nil, err
+	}
+	defer b.vm.Reset()
+
+	// 4. Transfer result [N, 3] back to Host
+	if machine, ok := b.vm.(gorgonia.CUDAMachine); ok {
+		machine.TransferToHost(b.out)
+	}
+
+	// 5. Reshape output back to [N, 3]
+	return reshapeOutput(b.out.Value().Data().([]float64), len(radarInputs)), nil
 }
 
 // getBrainInputs generates the 16-variable state representation for the NN.
@@ -420,6 +479,10 @@ func loadSystemState() {
 		gorgonia.Let(brain.w1, w1T)
 	}
 
+	// NEW: After loading weights into nodes, we must signal the CUDA VM
+	// to re-bind these values to the GPU memory.
+	brain.vm.Reset()
+
 	// Ensure we preserve the historical "Tightest Fleet" record
 	dec.Decode(&minEverRadars)
 	dec.Decode(&MaxRadars)
@@ -428,6 +491,13 @@ func loadSystemState() {
 func saveSystemState() {
 	mu.RLock() // Protect entities during JSON file preparation
 	defer mu.RUnlock()
+
+	// NEW: Explicitly pull data from GPU to CPU before saving
+	if machine, ok := brain.vm.(gorgonia.CUDAMachine); ok {
+		machine.TransferToHost(brain.w0)
+		machine.TransferToHost(brain.w1)
+	}
+
 	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
 	f, err := os.Create(BrainFile)
 	if err == nil {
@@ -945,6 +1015,7 @@ func runPhysicsEngine(ctx context.Context) {
 						}{li, lt, lr, lp, lMisses}
 					}()
 				}
+
 			}
 
 			go func() { wg.Wait(); close(workerKills); close(workerStats) }()
@@ -1038,108 +1109,147 @@ func runPhysicsEngine(ctx context.Context) {
 			// NN Prediction & Actions
 			dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
 
+			// BATCHING TO CUDA
+			mu.RLock()
 			for _, e := range entities {
-				select {
-				case <-ctx.Done():
-					// This case triggers the moment cancel() is called elsewhere
+				if e.Type == "RADAR" {
+					activeRadars = append(activeRadars, e)
+					// input := getBrainInputs(...) logic here
+					batchInputs = append(batchInputs, getBrainInputs(e, rCount, budget, successRate, quadrantRadars, satCount, dayProgress))
+				}
+			}
+			mu.RUnlock()
 
-					return
-				default:
-					if e.Type != "RADAR" {
-						continue
-					}
+			// 2. RUN GPU INFERENCE (All cores used)
+			if len(batchInputs) > 0 {
+				results, err := brain.PredictBatch(batchInputs)
+				if err == nil {
+					for i, res := range results {
+						// Check for context cancellation during processing
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							e := activeRadars[i]
 
-					// Get specific context for this radar [cite: 2026-02-08]
-					input := getBrainInputs(e, rCount, budget, successRate, quadrantRadars, satCount, dayProgress)
+							// Extract raw NN outputs
+							actionValue := res[0]
+							latN, lonN := res[1], res[2]
 
-					// action is an int (0, 1, or 2)
-					action, latN, lonN := brain.PredictSpatial(input)
-
-					// --- KICKSTART LOGIC ---CHEAT
-					// If we haven't moved in 100 eras and success is low, force an action
-					//if successRate <= 50.0 && rand.Float64() < 0.05 {
-					//	if rCount < MaxRadars {
-					//		action = 1 // Force Build
-					//	} else {
-					//		action = 2 // Force Relocate
-					//	}
-					//}
-
-					prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
-
-					canAffordBuild := (rCount < MaxRadars) && (budget >= RadarCost)
-					canAffordMove := budget >= RelocationCost
-
-					if action == 1 && canAffordBuild {
-						tQ := 0
-						maxM := -1.0
-						for i, m := range quadrantMisses {
-							if m > maxM {
-								maxM = m
-								tQ = i
-							}
-						}
-						bLat, bLon := getTargetedTether(tQ)
-						id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-						entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
-
-						kills[id] = 0
-
-						if budget >= RadarCost {
-							budget -= RadarCost
-						}
-						rCount = rCount + 1
-					} else if action == 2 && canAffordMove {
-						var worstID string
-						minK := 999999
-
-						// 1. Identify the most "Useless" Radar
-						for id, c := range kills {
-							if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
-								minK = c
-								worstID = id
-							}
-						}
-
-						if e, ok := entities[worstID]; ok {
-							// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
-							targetQ := 0
-							maxMiss := -1.0
-							for i, m := range quadrantMisses {
-								if m > maxMiss {
-									maxMiss = m
-									targetQ = i
-								}
+							// Determine Discrete Action
+							action := 0
+							if actionValue > 0.1 {
+								action = 1 // BUILD
+							} else if actionValue < -0.1 {
+								action = 2 // RELOCATE
 							}
 
-							// 3. TARGETED LEAP: Get a base position in that specific quadrant
-							// Instead of e.Lat = e.Lat + nudge, we do:
-							bLat, bLon := getTargetedTether(targetQ)
-
-							// 4. APPLY POSITION: Leap to the city, then use NN nudge for local offset
-							// precision here should be around 50-100km to spread them out around the city
-							e.Lat = bLat + (latN * 50.0 / 111.0) // 111km per degree approx
-							e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
-
-							e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
-
-							kills[worstID] = 0 // Reset performance for the new era
-
-							e.LastMoved = time.Now().UnixMilli()
-
-							if budget >= RelocationCost {
-								budget -= RelocationCost
-							}
-							//fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
+							// 3. APPLY YOUR CUSTOM LOGIC (Kickstart, Targeted Leap, Budgeting)
+							processAdvancedAction(ctx, e, action, latN, lonN, successRate, rCount, quadrantRadars, satCount, dayProgress)
 						}
+						runtime.Gosched()
 					}
 				}
 			}
-			simClock = simClock.Add(TimeStepping)
-			runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
-			//time.Sleep(10 * time.Millisecond) // Prevents 100% CPU lock
 		}
 	}
+}
+
+func processAdvancedAction(ctx context.Context, e *Entity, action int, latN float64, lonN float64, successRate float64, rCount int, quadrantRadars []float64, satCount int, dayProgress float64) {
+	select {
+	case <-ctx.Done():
+		// This case triggers the moment cancel() is called elsewhere
+		return
+	default:
+		// --- KICKSTART LOGIC ---CHEAT
+		// If we haven't moved in 100 eras and success is low, force an action
+		//if successRate <= 50.0 && rand.Float64() < 0.05 {
+		//	if rCount < MaxRadars {
+		//		action = 1 // Force Build
+		//	} else {
+		//		action = 2 // Force Relocate
+		//	}
+		//}
+
+		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
+
+		canAffordBuild := (rCount < MaxRadars) && (budget >= RadarCost)
+		canAffordMove := budget >= RelocationCost
+
+		if action == 1 && canAffordBuild {
+			tQ := 0
+			maxM := -1.0
+			for i, m := range quadrantMisses {
+				if m > maxM {
+					maxM = m
+					tQ = i
+				}
+			}
+			mu.Lock()
+			bLat, bLon := getTargetedTether(tQ)
+			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
+			kills[id] = 0
+			if budget >= RadarCost {
+				budget -= RadarCost
+			}
+			rCount = rCount + 1
+			mu.Unlock()
+		} else if action == 2 && canAffordMove {
+			var worstID string
+			minK := 999999
+
+			mu.RLock()
+			// 1. Identify the most "Useless" Radar
+			for id, c := range kills {
+				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
+					minK = c
+					worstID = id
+				}
+			}
+			mu.RUnlock()
+			mu.RLock()
+			if e, ok := entities[worstID]; ok {
+				mu.RUnlock()
+				// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
+				targetQ := 0
+				maxMiss := -1.0
+				for i, m := range quadrantMisses {
+					if m > maxMiss {
+						maxMiss = m
+						targetQ = i
+					}
+				}
+
+				mu.Lock()
+				// 3. TARGETED LEAP: Get a base position in that specific quadrant
+				// Instead of e.Lat = e.Lat + nudge, we do:
+				bLat, bLon := getTargetedTether(targetQ)
+				mu.Unlock()
+
+				// 4. APPLY POSITION: Leap to the city, then use NN nudge for local offset
+				// precision here should be around 50-100km to spread them out around the city
+				e.Lat = bLat + (latN * 50.0 / 111.0) // 111km per degree approx
+				e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
+
+				e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
+
+				kills[worstID] = 0 // Reset performance for the new era
+
+				e.LastMoved = time.Now().UnixMilli()
+
+				if budget >= RelocationCost {
+					budget -= RelocationCost
+				}
+				//fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
+			} else {
+				mu.RUnlock()
+			}
+		}
+	}
+	mu.Lock()
+	simClock = simClock.Add(TimeStepping)
+	mu.Unlock()
 }
 
 func getCityData() map[string][]float64 {
