@@ -1325,19 +1325,24 @@ const uiHTML = `
     #stats { 
         position:fixed; top:15px; left:15px; z-index:1000; 
         background:rgba(0,10,20,0.9); padding:20px; border:1px solid #0af; 
-        box-shadow: 0 0 15px rgba(0,170,255,0.3); border-radius: 8px; width: 300px;
+        box-shadow: 0 0 15px rgba(0,170,255,0.3); border-radius: 8px; width: 320px;
         backdrop-filter: blur(5px);
     } 
     #map { height:100vh; width:100vw; background: #000; }
     .stat-line { font-size: 0.95em; margin-bottom: 8px; display: flex; justify-content: space-between; border-bottom: 1px solid #0af2; padding-bottom: 4px; }
     .val { color: #fff; font-weight: bold; }
+    
+    /* Confidence & Intelligence Dashboard */
     .intel-box { 
         margin-top: 15px; padding: 12px; border: 1px solid #fb0; 
         background: rgba(251, 176, 0, 0.1); text-align: center; border-radius: 4px;
     }
-    #intensity { font-weight: bold; font-size: 1.1em; display: block; letter-spacing: 1px; }
-    #lr-val { font-size: 0.8em; color: #aaa; margin-top: 5px; display: block; }
-    
+    #confidence-bar { height: 6px; background: #111; margin-top: 10px; border-radius: 3px; border: 1px solid #0af3; overflow: hidden; }
+    #confidence-fill { height: 100%; width: 0%; transition: 0.8s cubic-bezier(0.4, 0, 0.2, 1); background: #fb0; }
+    #ai-level { font-weight: bold; font-size: 0.85em; display: block; margin-top: 5px; text-transform: uppercase; letter-spacing: 1px; }
+    #lr-val { font-size: 0.75em; color: #aaa; margin-top: 4px; display: block; }
+
+    /* Control Buttons */
     .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 15px; }
     .ctrl-btn {
         width: 100%; padding: 10px; font-family: inherit; font-weight: bold;
@@ -1346,7 +1351,7 @@ const uiHTML = `
     #save-btn { border: 1px solid #0af; color: #0af; }
     #save-btn:hover { background: #0af; color: #000; box-shadow: 0 0 10px #0af; }
     #panic-btn { border: 1px solid #f44; color: #f44; background: rgba(100,0,0,0.1); }
-    #panic-btn:hover { background: #f44; color: #000; }
+    #panic-btn:hover { background: #f44; color: #000; box-shadow: 0 0 10px #f44; }
 </style></head>
 <body>
 <div id="stats">
@@ -1359,12 +1364,14 @@ const uiHTML = `
     <div class="stat-line">BUDGET <span id="budget" class="val" style="color:#fb0">$0</span></div>
     
     <div class="intel-box">
-        <span id="intensity">ANALYZING...</span>
-        <span id="lr-val">MUTATION: 0.00000</span>
+        <span style="font-size:0.7em; color:#aaa; font-weight: bold;">AI COGNITION LEVEL</span>
+        <span id="ai-level">CALIBRATING...</span>
+        <div id="confidence-bar"><div id="confidence-fill"></div></div>
+        <span id="lr-val">MUTATION RATE: 0.00000</span>
     </div>
 
     <div class="btn-group">
-        <button id="save-btn" class="ctrl-btn" onclick="saveRadarFile()">SAVE RADARS STATE</button>
+        <button id="save-btn" class="ctrl-btn" onclick="saveRadarFile()">SAVE OPTIMIZED RADAR STATE</button>
         <button id="panic-btn" class="ctrl-btn" onclick="triggerPanic()">INITIATE SYSTEM PURGE</button>
     </div>
 </div>
@@ -1376,6 +1383,16 @@ const uiHTML = `
     
     var layers = {};
     var isFetching = false;
+
+    function getAILogic(yps, success) {
+        // Incremental Levels of Confidence vs. Throughput
+        if (success > 99.8 && yps < 0.0001) return { label: "OVER-CONFIDENT", color: "#0af", width: 100 };
+        if (success > 99) return { label: "STEADY STATE", color: "#0f0", width: 85 };
+        if (success > 95) return { label: "REINFORCING PATTERNS", color: "#fb0", width: 65 };
+        if (yps > 0.05) return { label: "HEURISTIC DISCOVERY", color: "#f70", width: 45 };
+        if (yps > 0.01) return { label: "AGGRESSIVE LEARNING", color: "#f44", width: 30 };
+        return { label: "INITIAL EXPLORATION", color: "#aaa", width: 15 };
+    }
 
     async function saveRadarFile() {
         const btn = document.getElementById('save-btn');
@@ -1391,7 +1408,7 @@ const uiHTML = `
     }
 
     async function triggerPanic() {
-        if(!confirm("ARE YOU SURE? THIS WIPES THE NEURAL NETWORK WEIGHTS.")) return;
+        if(!confirm("WIPE NEURAL NETWORK WEIGHTS? This resets the learning streak.")) return;
         document.getElementById('status').innerText = "PURGING...";
         document.getElementById('status').style.color = "#f44";
         try { await fetch('/panic'); } catch (e) { console.error(e); }
@@ -1405,25 +1422,24 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // 1. Dashboard Sync
+            // 1. Dashboard Sync (Restored All Fields)
             document.getElementById('era').innerText = data.cycle || 0;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
             document.getElementById('budget').innerText = "$" + Math.floor(data.budget || 0).toLocaleString();
-            document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
+            document.getElementById('yps').innerText = (data.yps || 0).toFixed(6);
             document.getElementById('max_radars').innerText = data.max_radars || 120;
-            document.getElementById('lr-val').innerText = "MUTATION RATE: " + (data.mutation_rate || 0).toFixed(5);
+            document.getElementById('lr-val').innerText = "MUTATION: " + (data.mutation_rate || 0).toFixed(5);
 
-            const success = data.success || 0;
-            const intensityEl = document.getElementById('intensity');
-            if (success < 90) {
-                intensityEl.innerText = "CRISIS RECOVERY"; intensityEl.style.color = "#f44";
-            } else if (success < 99.9) {
-                intensityEl.innerText = "ACTIVE OPTIMIZATION"; intensityEl.style.color = "#fb0";
-            } else {
-                intensityEl.innerText = "STEADY STATE"; intensityEl.style.color = "#0af";
-            }
+            // 2. Confidence & Throughput Logic
+            const ai = getAILogic(data.yps || 0, data.success || 0);
+            const levelEl = document.getElementById('ai-level');
+            levelEl.innerText = ai.label;
+            levelEl.style.color = ai.color;
+            const fill = document.getElementById('confidence-fill');
+            fill.style.width = ai.width + "%";
+            fill.style.background = ai.color;
 
-            // 2. Map Rendering Logic
+            // 3. Map Rendering (Restored Pulse & Cleanup)
             const now = data.server_time || Date.now(); 
             const currentIds = new Set();
             let radarCount = 0;
@@ -1442,7 +1458,6 @@ const uiHTML = `
                     }
                 } else {
                     layers[e.id].setLatLng([e.lat, e.lon]);
-                    // Restored Relocation Pulse logic
                     const movedRecently = e.last_moved && (now - e.last_moved < 2000);
                     if (movedRecently) {
                         layers[e.id].setStyle({ color: '#ff0', weight: 5, fillOpacity: 0.5 });
@@ -1454,7 +1469,6 @@ const uiHTML = `
 
             document.getElementById('rcount').innerText = radarCount;
 
-            // Cleanup destroyed entities
             for (let id in layers) {
                 if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
@@ -1462,5 +1476,5 @@ const uiHTML = `
         isFetching = false;
     }
     
-    setInterval(updateUI, 43); // Cinematic 23 FPS
+    setInterval(updateUI, 43); // 23 FPS Sync
 </script></body></html>`
