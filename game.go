@@ -1252,6 +1252,10 @@ func handleConnection(conn net.Conn, cityData map[string][]float64) {
 		serveIntel(conn)
 	} else if bytes.Contains(buf[:n], []byte("GET /panic")) {
 		servePanic(conn, cityData)
+		sendHTTPResponse(conn, "text/html", []byte(uiHTML))
+	} else if bytes.Contains(buf[:n], []byte("GET /save")) {
+		saveSystemState()
+		sendHTTPResponse(conn, "text/html", []byte(uiHTML))
 	} else {
 		sendHTTPResponse(conn, "text/html", []byte(uiHTML))
 	}
@@ -1273,7 +1277,6 @@ func servePanic(conn net.Conn, cityData map[string][]float64) {
 		entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
 	}
 	forceReset = true
-	sendHTTPResponse(conn, "text/html", []byte(uiHTML))
 }
 
 func serveIntel(conn net.Conn) {
@@ -1331,13 +1334,16 @@ const uiHTML = `
     }
     #intensity { font-weight: bold; font-size: 1.1em; display: block; letter-spacing: 1px; }
     #lr-val { font-size: 0.8em; color: #aaa; margin-top: 5px; display: block; }
-    #panic-btn {
-        width: 100%; margin-top: 15px; padding: 10px;
-        background: rgba(100,0,0,0.4); color: #f44; border: 1px solid #f44;
-        cursor: pointer; font-family: inherit; font-weight: bold;
-        transition: 0.2s; border-radius: 4px;
+    
+    .btn-group { display: flex; flex-direction: column; gap: 8px; margin-top: 15px; }
+    .ctrl-btn {
+        width: 100%; padding: 10px; font-family: inherit; font-weight: bold;
+        cursor: pointer; transition: 0.2s; border-radius: 4px; background: transparent;
     }
-    #panic-btn:hover { background: #f44; color: #000; box-shadow: 0 0 10px #f44; }
+    #save-btn { border: 1px solid #0af; color: #0af; }
+    #save-btn:hover { background: #0af; color: #000; box-shadow: 0 0 10px #0af; }
+    #panic-btn { border: 1px solid #f44; color: #f44; background: rgba(100,0,0,0.1); }
+    #panic-btn:hover { background: #f44; color: #000; }
 </style></head>
 <body>
 <div id="stats">
@@ -1354,15 +1360,32 @@ const uiHTML = `
         <span id="lr-val">MUTATION: 0.00000</span>
     </div>
 
-    <button id="panic-btn" onclick="triggerPanic()">INITIATE SYSTEM PURGE</button>
+    <div class="btn-group">
+        <button id="save-btn" class="ctrl-btn" onclick="saveRadarFile()">SAVE RADARS STATE</button>
+        <button id="panic-btn" class="ctrl-btn" onclick="triggerPanic()">INITIATE SYSTEM PURGE</button>
+    </div>
 </div>
 <div id="map"></div>
+
 <script>
     var map = L.map('map', { zoomControl:false, attributionControl:false, preferCanvas: true }).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
     
     var layers = {};
     var isFetching = false;
+
+    async function saveRadarFile() {
+        const btn = document.getElementById('save-btn');
+        btn.innerText = "WRITING TO DISK...";
+        try { 
+            const resp = await fetch('/save'); 
+            if(resp.ok) {
+                btn.innerText = "RADAR.JSON SECURED";
+                btn.style.color = "#0f0";
+                setTimeout(() => { btn.innerText = "SAVE OPTIMIZED RADAR STATE"; btn.style.color = "#0af"; }, 2000);
+            }
+        } catch (e) { btn.innerText = "SAVE FAILED"; }
+    }
 
     async function triggerPanic() {
         if(!confirm("ARE YOU SURE? THIS WIPES THE NEURAL NETWORK WEIGHTS.")) return;
@@ -1379,35 +1402,25 @@ const uiHTML = `
             const response = await fetch('/intel');
             const data = await response.json();
 
-            // 1. Sync Dashboard
-            document.getElementById('era').innerText = data.cycle;
+            // 1. Dashboard Sync
+            document.getElementById('era').innerText = data.cycle || 0;
             document.getElementById('success').innerText = (data.success || 0).toFixed(2);
-            document.getElementById('budget').innerText = "$" + Math.floor(data.budget).toLocaleString();
+            document.getElementById('budget').innerText = "$" + Math.floor(data.budget || 0).toLocaleString();
             document.getElementById('yps').innerText = (data.yps || 0).toFixed(4);
-            document.getElementById('max_radars').innerText = data.max_radars || 60;
-            
-            const success = data.success || 0;
-            const mutRate = data.mutation_rate || 0;
-            const intensityEl = document.getElementById('intensity');
-            
-            document.getElementById('lr-val').innerText = "MUTATION RATE: " + mutRate.toFixed(5);
+            document.getElementById('max_radars').innerText = data.max_radars || 120;
+            document.getElementById('lr-val').innerText = "MUTATION RATE: " + (data.mutation_rate || 0).toFixed(5);
 
-            // Dynamic Status Coloring
-            if (success < 80) {
-                intensityEl.innerText = "CRISIS RECOVERY";
-                intensityEl.style.color = "#f44";
-                document.getElementById('status').style.color = "#fb0";
-            } else if (success < 99) {
-                intensityEl.innerText = "ACTIVE OPTIMIZATION";
-                intensityEl.style.color = "#fb0";
-                document.getElementById('status').style.color = "#0f0";
+            const success = data.success || 0;
+            const intensityEl = document.getElementById('intensity');
+            if (success < 90) {
+                intensityEl.innerText = "CRISIS RECOVERY"; intensityEl.style.color = "#f44";
+            } else if (success < 99.9) {
+                intensityEl.innerText = "ACTIVE OPTIMIZATION"; intensityEl.style.color = "#fb0";
             } else {
-                intensityEl.innerText = "STEADY STATE";
-                intensityEl.style.color = "#0af";
+                intensityEl.innerText = "STEADY STATE"; intensityEl.style.color = "#0af";
             }
 
-            // 2. Rendering Logic with Server-Time Sync
-            // Use the server's own clock if provided, otherwise fallback to local
+            // 2. Map Rendering Logic
             const now = data.server_time || Date.now(); 
             const currentIds = new Set();
             let radarCount = 0;
@@ -1417,7 +1430,6 @@ const uiHTML = `
                 if (e.type === 'RADAR') radarCount++;
 
                 if (!layers[e.id]) {
-                    // Initial Creation
                     if (e.type === 'RADAR') {
                         layers[e.id] = L.circle([e.lat, e.lon], { radius: 1200000, color: '#0f0', weight: 1, fillOpacity: 0.1 }).addTo(map);
                     } else if (e.type === 'SAT') {
@@ -1426,28 +1438,20 @@ const uiHTML = `
                         layers[e.id] = L.circleMarker([e.lat, e.lon], { radius: 3, color: '#f44', fillOpacity: 0.7 }).addTo(map);
                     }
                 } else {
-                    // Update Position
                     layers[e.id].setLatLng([e.lat, e.lon]);
-                    
-                    // RELOCATION PULSE: Highlight yellow if LastMoved happened in last 2 seconds
+                    // Restored Relocation Pulse logic
                     const movedRecently = e.last_moved && (now - e.last_moved < 2000);
-                    
                     if (movedRecently) {
-                        layers[e.id].setStyle({ color: '#ff0', weight: 5, fillOpacity: 0.5, radius: 1500000 });
-                    } else {
-                        // Reset to standard style
-                        if (e.type === 'RADAR') {
-                            layers[e.id].setStyle({color: '#0f0', weight: 1, fillOpacity: 0.1, radius: 1200000});
-                        } else if (e.type === 'SAT') {
-                            layers[e.id].setStyle({color: '#0af', weight: 1, fillOpacity: 0.05});
-                        }
+                        layers[e.id].setStyle({ color: '#ff0', weight: 5, fillOpacity: 0.5 });
+                    } else if (e.type === 'RADAR') {
+                        layers[e.id].setStyle({ color: '#0f0', weight: 1, fillOpacity: 0.1 });
                     }
                 }
             });
 
             document.getElementById('rcount').innerText = radarCount;
 
-            // Cleanup destroyed entities (missiles that hit/intercepted)
+            // Cleanup destroyed entities
             for (let id in layers) {
                 if (!currentIds.has(id)) { map.removeLayer(layers[id]); delete layers[id]; }
             }
@@ -1455,5 +1459,5 @@ const uiHTML = `
         isFetching = false;
     }
     
-    setInterval(updateUI, 43);
+    setInterval(updateUI, 43); // Cinematic 23 FPS
 </script></body></html>`
