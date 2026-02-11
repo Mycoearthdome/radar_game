@@ -275,9 +275,12 @@ func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
 	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
 	gorgonia.Let(b.x, inputT)
 
+	mu.Lock()
 	if err := b.vm.RunAll(); err != nil {
 		return 0, 0, 0
 	}
+	mu.Unlock()
+
 	// We must Reset BEFORE we release the lock
 	defer b.vm.Reset()
 
