@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"html/template"
 	"math"
 	"math/rand"
-	"net/http"
+	"net"
 	"os"
 	"runtime"
 	"sort"
@@ -110,6 +110,7 @@ type Entity struct {
 }
 
 type Brain struct {
+	mu  sync.Mutex
 	g   *gorgonia.ExprGraph
 	w0  *gorgonia.Node
 	w1  *gorgonia.Node
@@ -261,48 +262,40 @@ func (b *Brain) Train(inputs []float64, idealAction []float64) {
 }
 
 func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
-	if len(inputs) != 18 || b.g == nil {
+	if b.g == nil || b.vm == nil || b.out == nil {
 		return 0, 0, 0
 	}
 
-	// 1. Bind inputs to the 'x' node
+	// USE THE BRAIN'S LOCK, NOT THE GLOBAL MAP LOCK
+	// This prevents the training loop from touching the tensors
+	// while the VM is reading them.
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
-	if err := gorgonia.Let(b.x, inputT); err != nil {
+	gorgonia.Let(b.x, inputT)
+
+	if err := b.vm.RunAll(); err != nil {
+		return 0, 0, 0
+	}
+	// We must Reset BEFORE we release the lock
+	defer b.vm.Reset()
+
+	// CRITICAL SAFETY CHECK: Ensure the value exists before calling .Data()
+	val := b.out.Value()
+	if val == nil {
 		return 0, 0, 0
 	}
 
-	// 2. IMPORTANT: We only execute the subgraph required for 'out'
-	// This ignores target_signal and cost nodes entirely.
-	prog, locs, err := gorgonia.Compile(b.g)
-	if err != nil {
-		panic(err)
-	}
-
-	// We use a local TapeMachine to avoid state conflicts with the Training VM
-	vm := gorgonia.NewTapeMachine(b.g, gorgonia.WithPrecompiled(prog, locs))
-
-	// 3. RUN ONLY THE OUTPUT PATH
-	// Use RunInstruction to target just the output, or bind a dummy to target_signal
-	// If you want to use the simpler 'RunAll', you MUST bind a dummy to target:
-	dummyTarget := tensor.New(tensor.WithShape(1, 3), tensor.WithBacking([]float64{0, 0, 0}))
-	gorgonia.Let(b.target, dummyTarget)
-
-	if err := vm.RunAll(); err != nil {
-		fmt.Printf("[ERROR] Prediction failed: %v\n", err)
-		vm.Close()
-		return 0, 0, 0
-	}
-
-	// 4. Extract data and close
-	res := b.out.Value().Data().([]float64)
-	vm.Close()
+	res := val.Data().([]float64)
 
 	action := 0
 	if res[0] > 0.1 {
-		action = 1 // STAY
+		action = 1
 	} else if res[0] < -0.1 {
-		action = 2 // MOVE
+		action = 2
 	}
+
 	return action, res[1], res[2]
 }
 
@@ -941,6 +934,9 @@ func runPhysicsEngine() {
 
 		// Adjust learning rate: The better we do, the less we "mutate"
 		currentLR := 0.01
+		if successRate < 99.0 {
+			currentLR = 0.01
+		}
 		if successRate >= 99.0 {
 			currentLR = 0.001 // Reduce by 10x for stability
 		}
@@ -989,11 +985,8 @@ func runPhysicsEngine() {
 
 		// NN Prediction & Actions
 		dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
-		mu.RLock()
-		entities_clone := entities
-		kills_clone := kills
-		mu.RUnlock()
-		for _, e := range entities_clone {
+
+		for _, e := range entities {
 			if e.Type != "RADAR" {
 				continue
 			}
@@ -1030,9 +1023,9 @@ func runPhysicsEngine() {
 				}
 				bLat, bLon := getTargetedTether(tQ)
 				id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-				entities_clone[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
+				entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
 
-				kills_clone[id] = 0
+				kills[id] = 0
 
 				if budget >= RadarCost {
 					budget -= RadarCost
@@ -1043,14 +1036,14 @@ func runPhysicsEngine() {
 				minK := 999999
 
 				// 1. Identify the most "Useless" Radar
-				for id, c := range kills_clone {
-					if e, ok := entities_clone[id]; ok && e.Type == "RADAR" && c < minK {
+				for id, c := range kills {
+					if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
 						minK = c
 						worstID = id
 					}
 				}
 
-				if e, ok := entities_clone[worstID]; ok {
+				if e, ok := entities[worstID]; ok {
 					// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
 					targetQ := 0
 					maxMiss := -1.0
@@ -1072,7 +1065,7 @@ func runPhysicsEngine() {
 
 					e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
 
-					kills_clone[worstID] = 0 // Reset performance for the new era
+					kills[worstID] = 0 // Reset performance for the new era
 
 					e.LastMoved = time.Now().UnixMilli()
 
@@ -1084,12 +1077,8 @@ func runPhysicsEngine() {
 			}
 		}
 		simClock = simClock.Add(TimeStepping)
-		mu.Lock()
-		kills = kills_clone
-		entities = entities_clone
-		mu.Unlock()
 		runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
-		//time.Sleep(20 * time.Millisecond) // Prevents 100% CPU lock
+		//time.Sleep(10 * time.Millisecond) // Prevents 100% CPU lock
 	}
 }
 
@@ -1216,64 +1205,109 @@ func main() {
 	wallStart = time.Now()
 	go runPhysicsEngine()
 
-	// 5. HTTP HANDLERS
-	http.HandleFunc("/panic", func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		entities = make(map[string]*Entity)
-		cityNames = []string{}
-		kills = make(map[string]int)
-		mu.Unlock()
-		for name, pos := range cityData {
-			entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
-			cityNames = append(cityNames, name)
-		}
-		for i := 0; i < MinRadars; i++ {
-			id := fmt.Sprintf("R-START-%d", i)
-			lat, lon := getTetheredCoords()
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
-		}
-		forceReset = true
-		w.Write([]byte("Shield Re-initialized Successfully"))
-	})
-
-	http.HandleFunc("/intel", func(w http.ResponseWriter, r *http.Request) {
-		// Calculate Years Per Second
-		realSeconds := time.Since(wallStart).Seconds()
-		simHours := simClock.Sub(eraStartTime).Hours() + (float64(currentCycle-1) * EraDuration.Hours())
-		simYears := simHours / (24 * 365)
-
-		yps := 0.0
-		if realSeconds > 0 {
-			yps = simYears / realSeconds
-		}
-		mu.Lock()
-		var all []Entity
-		for _, e := range entities {
-			all = append(all, *e)
-		}
-		mu.Unlock()
-
-		// UPDATED: Added max_radars for the UI dashboard
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cycle":         currentCycle,
-			"budget":        budget,
-			"entities":      all,
-			"success":       successRate,
-			"streak":        winStreakCounter,
-			"isOver":        isSimulationOver,
-			"yps":           yps,
-			"max_radars":    MaxRadars,
-			"mutation_rate": mutationRate,
-			"server_time":   time.Now().UnixMilli(),
-		})
-	})
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		template.Must(template.New("v").Parse(uiHTML)).Execute(w, nil)
-	})
-
 	fmt.Println("AEGIS RUNNING AT :8080")
-	http.ListenAndServe(":8080", nil)
+	startManualServer(cityData)
+}
+
+func sendHTTPResponse(conn net.Conn, contentType string, data []byte) {
+	header := fmt.Sprintf(
+		"HTTP/1.1 200 OK\r\n"+
+			"Content-Type: %s\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: close\r\n\r\n",
+		contentType, len(data),
+	)
+	conn.Write([]byte(header))
+	conn.Write(data)
+}
+
+func startManualServer(cityData map[string][]float64) {
+	listener, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		return
+	}
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		// Handle each connection in a way that respects your Mutex
+		go handleConnection(conn, cityData)
+	}
+}
+
+func handleConnection(conn net.Conn, cityData map[string][]float64) {
+	defer conn.Close()
+
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+
+	// Use bytes.Contains for the check
+	if bytes.Contains(buf[:n], []byte("GET /intel")) {
+		// Prepare Intel Data
+		serveIntel(conn)
+	} else if bytes.Contains(buf[:n], []byte("GET /panic")) {
+		servePanic(conn, cityData)
+	} else {
+		sendHTTPResponse(conn, "text/html", []byte(uiHTML))
+	}
+}
+
+func servePanic(conn net.Conn, cityData map[string][]float64) {
+	mu.Lock()
+	entities = make(map[string]*Entity)
+	cityNames = []string{}
+	kills = make(map[string]int)
+	mu.Unlock()
+	for name, pos := range cityData {
+		entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
+		cityNames = append(cityNames, name)
+	}
+	for i := 0; i < MinRadars; i++ {
+		id := fmt.Sprintf("R-START-%d", i)
+		lat, lon := getTetheredCoords()
+		entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
+	}
+	forceReset = true
+	sendHTTPResponse(conn, "text/html", []byte(uiHTML))
+}
+
+func serveIntel(conn net.Conn) {
+	// Calculate Years Per Second
+	realSeconds := time.Since(wallStart).Seconds()
+	mu.RLock()
+	simHours := simClock.Sub(eraStartTime).Hours() + (float64(currentCycle-1) * EraDuration.Hours())
+	mu.RUnlock()
+	simYears := simHours / (24 * 365)
+
+	yps := 0.0
+	if realSeconds > 0 {
+		yps = simYears / realSeconds
+	}
+
+	mu.RLock()
+	var all []Entity
+	for _, e := range entities {
+		all = append(all, *e)
+	}
+	mu.RUnlock()
+
+	json.NewEncoder(conn).Encode(map[string]interface{}{
+		"cycle":         currentCycle,
+		"budget":        budget,
+		"entities":      all,
+		"success":       successRate,
+		"streak":        winStreakCounter,
+		"isOver":        isSimulationOver,
+		"yps":           yps,
+		"max_radars":    MaxRadars,
+		"mutation_rate": mutationRate,
+		"server_time":   time.Now().UnixMilli(),
+	})
 }
 
 const uiHTML = `
@@ -1421,5 +1455,5 @@ const uiHTML = `
         isFetching = false;
     }
     
-    setInterval(updateUI, 600); // 60Hz Refresh rate
+    setInterval(updateUI, 43);
 </script></body></html>`
