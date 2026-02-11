@@ -712,7 +712,11 @@ func getTargetedTether(quadrant int) (float64, float64) {
 
 	mu.RLock()
 	for _, name := range cityNames {
-		city := entities[name]
+		city, exists := entities[name]
+		// SAFETY CHECK: Ensure the city actually exists in the map
+		if !exists || city == nil {
+			continue
+		}
 		// Map Lat/Lon to 0-3 Quadrant ID (NW: 0, NE: 1, SW: 2, SE: 3)
 		qIdx := 0
 		if city.Lat < 0 {
