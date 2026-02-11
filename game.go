@@ -763,7 +763,7 @@ func runPhysicsEngine(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			// This case triggers the moment cancel() is called elsewhere
-			fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 			return
 		default:
 			if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
@@ -795,7 +795,7 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-					fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 					return
 				default:
 					if e.Type == "SAT" {
@@ -820,7 +820,7 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-					fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 					return
 				default:
 					snap[id] = EntityVal{ID: e.ID, Type: e.Type, Lat: e.Lat, Lon: e.Lon}
@@ -859,7 +859,7 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-					fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 					return
 				default:
 					wg.Add(1)
@@ -948,7 +948,7 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-					fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 					return
 				default:
 					mu.Lock()
@@ -965,7 +965,7 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-					fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 					return
 				default:
 					totalIntercepts += ls.ints
@@ -1037,7 +1037,7 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-					fmt.Println("Physics Engine received kill signal. Cleaning up...")
+
 					return
 				default:
 					if e.Type != "RADAR" {
