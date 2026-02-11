@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -378,7 +379,7 @@ func loadSystemState() {
 				}
 			}
 			mu.Unlock()
-			fmt.Printf("Successfully loaded %d entities from persistence.\n", len(savedEntities))
+			log.Printf("Successfully loaded %d entities from persistence.\n", len(savedEntities))
 		}
 	}
 
@@ -395,9 +396,9 @@ func loadSystemState() {
 	if err := dec.Decode(&w0T); err == nil {
 		currentShape := w0T.Shape()[0]
 		// Migration logic for 12-input architecture
-		if currentShape < 12 {
-			fmt.Printf("Migrating %d-input brain to 12-input...\n", currentShape)
-			newW0 := tensor.New(tensor.WithShape(12, 16), tensor.WithBacking(make([]float64, 12*16)))
+		if currentShape < 18 {
+			log.Printf("Migrating %d-input brain to 18-input...\n", currentShape)
+			newW0 := tensor.New(tensor.WithShape(12, 18), tensor.WithBacking(make([]float64, 12*18)))
 			oldData := w0T.Data().([]float64)
 			newData := newW0.Data().([]float64)
 
@@ -514,7 +515,7 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 		if rCount < minEverRadars {
 			minEverRadars = rCount
 			MaxRadars = minEverRadars
-			fmt.Printf("\nNEW RECORD: Max fleet size tightened to %d units.\n", MaxRadars)
+			log.Printf("\nNEW RECORD: Max fleet size tightened to %d units.\n", MaxRadars)
 			saveSystemState()
 		}
 	}
@@ -570,7 +571,7 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 
 	// 5. CRISIS RECOVERY
 	if budget < BankruptcyLimit || (rCount < MinRadars && budget < RadarCost) {
-		fmt.Println("\nCRISIS: Adaptive Mutation Triggered...")
+		log.Println("CRISIS: Adaptive Mutation Triggered...")
 		brain.AdaptiveMutate(successRate)
 		budget = EmergencyBudget // Emergency Capital Injection
 	}
@@ -1005,15 +1006,15 @@ func runPhysicsEngine(ctx context.Context) {
 			// Ensure a minimum threat volume before counting a 'Win' to prevent cheesing
 			if successRate >= 100.0 && (totalThreats+totalIntercepts) > 50 {
 				winStreakCounter++
-				fmt.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
+				log.Printf("\n[!] VICTORY STREAK: %d/%d Eras at 100%% efficiency.\n", winStreakCounter, RequiredWinStreak)
 
 				if winStreakCounter >= RequiredWinStreak {
-					fmt.Println("\n==================================================")
-					fmt.Println("CONVERGENCE REACHED: AEGIS SHIELD IS OPTIMIZED")
+					log.Println("\n==================================================")
+					log.Println("CONVERGENCE REACHED: AEGIS SHIELD IS OPTIMIZED")
 					mu.RLock()
-					fmt.Printf("Final Fleet Size: %d | Total Eras: %d\n", len(entities)-len(cityNames), currentCycle)
+					log.Printf("Final Fleet Size: %d | Total Eras: %d\n", len(entities)-len(cityNames), currentCycle)
 					mu.RUnlock()
-					fmt.Println("==================================================")
+					log.Println("==================================================")
 
 					isSimulationOver = true
 					saveSystemState()
@@ -1025,7 +1026,7 @@ func runPhysicsEngine(ctx context.Context) {
 				}
 			} else {
 				if winStreakCounter > 0 {
-					fmt.Printf("\n[!] STREAK BROKEN: Efficiency fell to %.2f%%\n", successRate)
+					log.Printf("\n[!] STREAK BROKEN: Efficiency fell to %.2f%%\n", successRate)
 				}
 				winStreakCounter = 0
 			}
@@ -1337,6 +1338,7 @@ func getCityData() map[string][]float64 {
 }
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	// 1. POPULATE CITIES
@@ -1347,7 +1349,7 @@ func main() {
 		cityNames = append(cityNames, name)
 	}
 
-	fmt.Printf("Protecting %d cities\n", len(cityData))
+	log.Printf("Protecting %d cities\n", len(cityData))
 
 	// 2. INITIALIZE NEURAL NETWORK
 	// Use a small multiplier for initial weight scaling to prevent saturation
@@ -1365,20 +1367,20 @@ func main() {
 		}
 	}
 	if radarCount < MinRadars {
-		fmt.Println("NO PERSISTENCE FOUND. INITIALIZING SEED FLEET...")
+		log.Println("NO PERSISTENCE FOUND. INITIALIZING SEED FLEET...")
 		for i := 0; i < MinRadars; i++ {
 			id := fmt.Sprintf("R-START-%d", i)
 			lat, lon := getTetheredCoords()
 			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
 		}
 	} else {
-		fmt.Printf("RESUMING ERA %d WITH %d OPTIMIZED ASSETS\n", currentCycle, radarCount)
+		log.Printf("RESUMING ERA %d WITH %d OPTIMIZED ASSETS\n", currentCycle, radarCount)
 	}
 
 	wallStart = time.Now()
 	go runPhysicsEngine(ctx)
 
-	fmt.Println("AEGIS RUNNING AT :8080")
+	log.Println("AEGIS RUNNING AT :8080")
 	startManualServer()
 }
 
