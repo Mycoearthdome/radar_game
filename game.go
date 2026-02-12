@@ -5,18 +5,28 @@ import (
 	"context"
 	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
+
 	"github.com/InternatBlackhole/cudago/cuda"
+
+	_ "embed"
 )
+
+//go:embed radar.ptx
+var ptxFile []byte
 
 const (
 	RadarRadiusKM           = 1200.0
@@ -29,7 +39,7 @@ const (
 	InterceptReward         = 10000.0
 	EarthRadius             = 6371.0
 	EraDuration             = 24 * time.Hour
-	TimeStepping            = 4 * time.Hour
+	TimeStepping            = 10 * time.Second
 	RadarFile               = "RADAR.json"
 	BrainFile               = "BRAIN.gob"
 	BankruptcyLimit         = 0.0
@@ -84,6 +94,7 @@ var (
 	ctx, cancel          = context.WithCancel(context.Background())
 	activeRadars         []*Entity
 	batchInputs          [][]float64
+	gpuJobs              chan Job
 )
 
 var launchSites = []struct{ Lat, Lon float64 }{
@@ -92,6 +103,10 @@ var launchSites = []struct{ Lat, Lon float64 }{
 	{5.23, -52.76},   // Kourou
 	{45.96, 63.30},   // Baikonur
 	{18.65, 100.48},  // Jiuquan
+}
+
+type Job struct {
+	Run func()
 }
 
 type Satellite struct {
@@ -113,75 +128,152 @@ type Entity struct {
 }
 
 type Brain struct {
-	mu  sync.Mutex
-	g   *gorgonia.ExprGraph
-	w0  *gorgonia.Node
-	w1  *gorgonia.Node
-	x   *gorgonia.Node
-	out *gorgonia.Node
+	mu sync.Mutex
 
-	targetSignal *gorgonia.Node
-	cost         *gorgonia.Node
+	// GPU Memory objects
+	// These hold the metadata for the allocations on your RTX 3060
+	w0_gpu *cuda.DeviceMemory
+	w1_gpu *cuda.DeviceMemory
 
-	vm     gorgonia.VM
-	solver gorgonia.Solver
+	// Local CPU copies for persistence and mutation
+	// Used for saving to BRAIN.gob and performing genetic crossovers
+	w0_cpu []float64
+	w1_cpu []float64
+
+	// The compiled CUDA kernel loaded from your .cubin or .ptx
+	kernel *cuda.Function
 }
 
-func (b *Brain) Mutate(rate float64) {
-	// Access the underlying tensors for weights
-	w0Data := b.w0.Value().Data().([]float64)
-	w1Data := b.w1.Value().Data().([]float64)
+func (b *Brain) SyncToGPU(context *cuda.PrimaryCtx) { // Pass the context in
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-	// Apply improved Gaussian noise + scaling to Hidden Layer
-	for i := range w0Data {
-		if rand.Float64() < 0.9 {
-			w0Data[i] += rand.NormFloat64() * rate
-		} else {
-			// Helps the AI escape "local minima" by scaling the weight
-			w0Data[i] *= (1.0 + (rand.NormFloat64() * rate))
-		}
+	// Force this thread to use our primary context
+	cuda.SetCurrentContext(&context.Context)
+	// 1. SAFETY CHECK: Ensure CPU slices are not empty or nil
+	if len(b.w0_cpu) == 0 || len(b.w1_cpu) == 0 {
+		log.Println("WARNING: SyncToGPU skipped - CPU weights are empty.")
+		return
 	}
 
-	// Apply improved Gaussian noise + scaling to Output Layer
-	for i := range w1Data {
-		if rand.Float64() < 0.9 {
-			w1Data[i] += rand.NormFloat64() * rate
-		} else {
-			w1Data[i] *= (1.0 + (rand.NormFloat64() * rate))
-		}
+	// 2. SAFETY CHECK: Ensure GPU memory was actually allocated
+	if b.w0_gpu == nil || b.w1_gpu == nil {
+		log.Println("ERROR: SyncToGPU failed - GPU device memory not initialized.")
+		return
+	}
+
+	size0 := uint64(len(b.w0_cpu) * 8)
+	size1 := uint64(len(b.w1_cpu) * 8)
+
+	// 3. Perform the Memcpy
+	res0 := b.w0_gpu.MemcpyToDevice(unsafe.Pointer(&b.w0_cpu[0]), size0)
+	if res0 != nil {
+		log.Printf("Error syncing w0: %s", res0.Error())
+		panic(res0.Error())
+	}
+
+	res1 := b.w1_gpu.MemcpyToDevice(unsafe.Pointer(&b.w1_cpu[0]), size1)
+	if res1 != nil {
+		log.Printf("Error syncing w1: %s", res1.Error())
+		panic(res1.Error())
+	}
+
+	log.Println("NN weights successfully UPLOADED to GPU.")
+}
+
+func (b *Brain) SyncFromGpu() {
+
+	var p_w0 runtime.Pinner
+	// Pin both slices so the GC doesn't move them during the transfer
+	p_w0.Pin(&b.w0_cpu[0])
+	defer p_w0.Unpin()
+
+	var p_w1 runtime.Pinner
+	p_w1.Pin(&b.w1_cpu[0])
+	defer p_w1.Unpin()
+
+	// Size in bytes: number of elements * 8 (float64)
+	size0 := uint64(len(b.w0_cpu) * 8)
+	size1 := uint64(len(b.w1_cpu) * 8)
+
+	// Using MemcpyFromDevice(dest unsafe.Pointer, srcSize uint64)
+	// This pulls the data from GPU memory (w0_gpu) into the CPU slice (w0_cpu)
+	res0 := b.w0_gpu.MemcpyFromDevice(unsafe.Pointer(&b.w0_cpu[0]), size0)
+	if res0 != nil {
+		log.Printf("Error downloading w0: %s", res0.Error())
+		panic(res0.Error())
+	}
+
+	res1 := b.w1_gpu.MemcpyFromDevice(unsafe.Pointer(&b.w1_cpu[0]), size1)
+	if res1 != nil {
+		log.Printf("Error downloading w1: %s", res1.Error())
+		panic(res1.Error())
+	}
+
+	log.Println("NN weights successfully DOWNLOADED from GPU.")
+}
+
+func (b *Brain) SyncDataToGPU(d_in *cuda.DeviceMemory, flatInputs []float64) {
+	size := uint64(len(flatInputs) * 8)
+
+	result := d_in.MemcpyToDevice(unsafe.Pointer(&flatInputs[0]), size)
+	if result != nil {
+		log.Printf("Error UPLOADING DATA to GPU function: %s", result.Error())
+		panic(result.Error())
 	}
 }
 
-func (b *Brain) AdaptiveMutate(success float64) {
-	// 1. Calculate Dynamic Jitter Rate
-	// High success (99%) = tiny jitter (0.002) - fine-tuning only.
-	// Low success (50%) = large jitter (0.1) - seeking new strategies.
-	rate := 0.2 * (1.0 - (success / 100.0))
-
-	// Clamp the rate to avoid total brain-wipe
-	if rate < 0.002 {
-		rate = 0.002
+func (b *Brain) SyncDataFromGPU(dest unsafe.Pointer, d_out *cuda.DeviceMemory, size uint64) {
+	// Size is passed as the number of bytes (elements * 8)
+	result := d_out.MemcpyFromDevice(dest, size)
+	if result != nil {
+		log.Printf("Error DOWNLOADING DATA to GPU function: %s", result.Error())
+		panic(result.Error())
 	}
-	mutationRate = rate
+}
 
-	//fmt.Printf("[Mutation] Success: %.2f%% | Applying Jitter Rate: %.5f\n", success, rate)
+func (b *Brain) Evaluate(input []float64) []float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
-	// 2. Access the Raw Data of the weights
-	// We mutate both the input-to-hidden (w0) and hidden-to-output (w1) layers.
-	for _, w := range []*gorgonia.Node{b.w0, b.w1} {
-		wT := w.Value().Data().([]float64)
+	// Wrap single input in a batch
+	batch := [][]float64{input}
 
-		for i := range wT {
-			// BIAS TOWARD STABILITY:
-			// Only mutate a percentage of weights based on the success rate.
-			// If success is 90%, only 10% of weights get jittered.
-			if rand.Float64() > (success / 100.0) {
-				// Apply Gaussian jitter
-				jitter := rand.NormFloat64() * rate
-				wT[i] += jitter
-			}
+	// Call GPU batch prediction
+	outputs, err := b.PredictBatch(batch)
+	if err != nil {
+		log.Printf("[Brain] Evaluate error: %v", err)
+		return nil
+	}
+
+	// Return the first (and only) output
+	if len(outputs) == 0 {
+		return nil
+	}
+
+	return outputs[0]
+}
+
+func (b *Brain) Mutate(rate float64, context *cuda.PrimaryCtx) {
+
+	for i := range b.w0_cpu {
+		if rand.Float64() < 0.9 {
+			b.w0_cpu[i] += rand.NormFloat64() * rate
+		} else {
+			b.w0_cpu[i] *= (1.0 + rand.NormFloat64()*rate)
 		}
 	}
+
+	for i := range b.w1_cpu {
+		if rand.Float64() < 0.9 {
+			b.w1_cpu[i] += rand.NormFloat64() * rate
+		} else {
+			b.w1_cpu[i] *= (1.0 + rand.NormFloat64()*rate)
+		}
+	}
+
+	// Correct GPU sync
+	b.SyncToGPU(context)
 }
 
 // Helper to get grid ID from coordinates
@@ -191,189 +283,246 @@ func getGridID(lat, lon float64) int {
 	return row*Cols + col
 }
 
-func NewBrain() *Brain {
-	g := gorgonia.NewGraph()
+func NewCudaBrain() *Brain {
+	// 1. Setup dimensions to match your game.go logic
+	const (
+		inputSize  = 18
+		hiddenSize = 24
+		outputSize = 3
+	)
 
-	// 1. Setup Nodes
-	x := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 18), gorgonia.WithName("x"))
-	targetSignal := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(1, 3), gorgonia.WithName("target"))
-
-	// Weights
-	w0 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(18, 24), gorgonia.WithName("w0"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
-	w1 := gorgonia.NewMatrix(g, tensor.Float64, gorgonia.WithShape(24, 3), gorgonia.WithName("w1"), gorgonia.WithInit(gorgonia.GlorotU(1.0)))
-
-	// 2. Forward Pass
-	h0 := gorgonia.Must(gorgonia.Mul(x, w0))
-	a0 := gorgonia.Must(gorgonia.LeakyRelu(h0, 0.1))
-	h1 := gorgonia.Must(gorgonia.Mul(a0, w1))
-	out := gorgonia.Must(gorgonia.Tanh(h1))
-
-	// 3. Loss & Gradients
-	cost := gorgonia.Must(gorgonia.Mean(gorgonia.Must(gorgonia.Square(gorgonia.Must(gorgonia.Sub(targetSignal, out))))))
-
-	// Pre-compile gradients for the solver
-	if _, err := gorgonia.Grad(cost, w0, w1); err != nil {
-		panic(err)
+	// 1. Load the PTX Module compiled by your compile.sh
+	// "radar.ptx" is the output from: nvcc -ptx radar.cu -o radar.ptx
+	mod, err := cuda.LoadModuleData(ptxFile)
+	if err != nil {
+		log.Fatalf("Failed to load PTX module: %v", err)
 	}
 
-	// 4. CUDA Initialization
-	// We use device 0 (your primary GPU).
-	// WithBindDualTree() allows the VM to manage both CPU/GPU memory sync.
-	machine := cuda.NewCUDAMachine(g, gorgonia.WithDevice(0), gorgonia.BindDualTree())
+	// 2. Get the function handle for your predictBatch kernel
+	kernel, err := mod.GetFunction("predictBatch")
+	if err != nil {
+		log.Fatalf("Failed to get kernel function: %v", err)
+	}
+
+	// 2. Allocate CPU memory
+	w0 := make([]float64, inputSize*hiddenSize)
+	w1 := make([]float64, hiddenSize*outputSize)
+
+	// 3. Manually apply Glorot/Xavier Initialization
+	// Formula: random value between ±sqrt(6 / (inputs + outputs))
+	limit0 := math.Sqrt(6.0 / float64(inputSize+hiddenSize))
+	for i := range w0 {
+		w0[i] = (rand.Float64()*2 - 1) * limit0
+	}
+
+	limit1 := math.Sqrt(6.0 / float64(hiddenSize+outputSize))
+	for i := range w1 {
+		w1[i] = (rand.Float64()*2 - 1) * limit1
+	}
+
+	// 4. Allocate GPU memory via CudaGo
+	w0_gpu, result := cuda.DeviceMemAlloc(uint64(len(w0) * 8))
+	if result != nil {
+		log.Printf("Error allocating w0: %v", result.Code())
+		panic(result.Error())
+	}
+
+	w1_gpu, result := cuda.DeviceMemAlloc(uint64(len(w1) * 8))
+	if result != nil {
+		log.Printf("Error allocating w1: %v", result.Code())
+		panic(result.Error())
+	}
+
+	// 5. Initial Sync
+	// Size in bytes: number of float64 elements * 8
+	size0 := uint64(len(w0) * 8)
+	size1 := uint64(len(w1) * 8)
+
+	// Using the method: MemcpyToDevice(src unsafe.Pointer, srcSize uint64)
+	// We get the pointer to the first element of the CPU slice
+	res0 := w0_gpu.MemcpyToDevice(unsafe.Pointer(&w0[0]), size0)
+	if res0 != nil {
+		log.Printf("Error syncing w0: %v", res0)
+	}
+
+	res1 := w1_gpu.MemcpyToDevice(unsafe.Pointer(&w1[0]), size1)
+	if res1 != nil {
+		log.Printf("Error syncing w1: %v", res1)
+	}
+
+	log.Println("NN weights successfully UPLOADED to GPU.")
 
 	return &Brain{
-		g:            g,
-		w0:           w0,
-		w1:           w1,
-		x:            x,
-		out:          out,
-		targetSignal: targetSignal,
-		cost:         cost,
-		vm:           machine,
-		solver:       gorgonia.NewVanillaSolver(gorgonia.WithLearnRate(0.01), gorgonia.WithClip(5.0)),
+		w0_cpu: w0,
+		w1_cpu: w1,
+		w0_gpu: w0_gpu,
+		w1_gpu: w1_gpu,
+		kernel: kernel,
 	}
 }
 
-func (b *Brain) Train(inputs []float64, idealAction []float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// 1. Bind the state
-	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
-	gorgonia.Let(b.x, inputT)
-
-	// 2. Bind the "Ideal" outcome
-	targetT := tensor.New(tensor.WithShape(1, 3), tensor.WithBacking(idealAction))
-	gorgonia.Let(b.targetSignal, targetT) // Use the field name from your struct
-
-	// 3. Execution
-	// Note: b.vm should already be a CUDAMachine from your NewBrain()
-	if err := b.vm.RunAll(); err != nil {
-		log.Printf("CUDA Train Error: %v", err)
-		return
+func (b *Brain) AdaptiveMutate(success float64, context *cuda.PrimaryCtx) {
+	// 1. Calculate Dynamic Jitter Rate
+	rate := 0.2 * (1.0 - (success / 100.0))
+	if rate < 0.002 {
+		rate = 0.002
 	}
 
-	// 4. Update Weights
-	// CUDAMachine handles the gradient calculations on the GPU
-	targets := []gorgonia.ValueGrad{b.w0, b.w1}
-	if err := b.solver.Step(targets); err != nil {
-		log.Printf("Solver Error: %v", err)
-	}
+	mutationRate = rate
 
-	// Reset for next pass
-	b.vm.Reset()
-}
-
-func (b *Brain) PredictSpatial(inputs []float64) (int, float64, float64) {
-	if b.g == nil || b.vm == nil || b.out == nil {
-		return 0, 0, 0
+	mutateSlice := func(s []float64) {
+		for i := range s {
+			if rand.Float64() > (success / 100.0) {
+				s[i] += rand.NormFloat64() * rate
+			}
+		}
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	mutateSlice(b.w0_cpu)
+	mutateSlice(b.w1_cpu)
+	b.mu.Unlock()
 
-	// 1. Prepare Input
-	inputT := tensor.New(tensor.WithShape(1, 18), tensor.WithBacking(inputs))
-	gorgonia.Let(b.x, inputT)
+	// Synchronize to GPU
+	b.SyncToGPU(context) // assumes SyncToGPU handles setting CUDA context internally
 
-	// 2. Run GPU Inference
-	if err := b.vm.RunAll(); err != nil {
-		return 0, 0, 0
-	}
-	defer b.vm.Reset()
-
-	// 3. TRANSFER TO HOST (Crucial for CUDA)
-	// If using CUDAMachine, we must pull the result from VRAM to RAM
-	if machine, ok := b.vm.(gorgonia.CUDAMachine); ok {
-		machine.TransferToHost(b.out)
-	}
-
-	// 4. Safely extract data
-	val := b.out.Value()
-	if val == nil {
-		return 0, 0, 0
-	}
-
-	res, ok := val.Data().([]float64)
-	if !ok || len(res) < 3 {
-		return 0, 0, 0
-	}
-
-	// Action Logic: 0=Stay, 1=Build/Reinforce, 2=Relocate
-	action := 0
-	if res[0] > 0.1 {
-		action = 1
-	} else if res[0] < -0.1 {
-		action = 2
-	}
-
-	return action, res[1], res[2]
+	log.Printf("[Brain] Mutated weights with rate %.5f based on %.2f%% success\n", rate, success)
 }
 
-// reshapeOutput converts a flat slice of float64s into a 2D matrix
-// with the specified number of rows and 3 columns.
-func reshapeOutput(flatData []float64, rows int) [][]float64 {
-	// The number of columns is fixed by your NN architecture (3)
-	const cols = 3
+func (b *Brain) Train(inputs []float64, idealAction []float64, context *cuda.PrimaryCtx) {
+	// We are already inside the GPU Worker goroutine here.
+	// The CUDA Context is set, and we are not holding the global 'mu' lock.
 
-	// Create the outer slice (rows)
-	matrix := make([][]float64, rows)
+	// 1. Calculate Error / Backprop Trigger
+	// In your genetic algorithm, we use the global success rate to determine
+	// if we should scramble weights (AdaptiveMutate) or refine them (Mutate).
 
-	for i := 0; i < rows; i++ {
-		// Create the inner slice (columns)
-		matrix[i] = make([]float64, cols)
-
-		// Copy the data for this row from the flat slice
-		start := i * cols
-		end := start + cols
-		copy(matrix[i], flatData[start:end])
+	if successRate < 95.0 {
+		// Low success: Needs major structural changes
+		// We call AdaptiveMutate directly. It handles its own locking internally.
+		b.AdaptiveMutate(successRate, context)
+	} else {
+		// High success: Fine-tuning only
+		// We use a small mutation rate to settle into the local minimum
+		b.Mutate(0.002, context)
 	}
 
-	return matrix
+	// Note: We do not need to calculate gradients here because this is a
+	// genetic/evolutionary algorithm, not standard backpropagation.
 }
 
-func (b *Brain) PredictBatch(radarInputs [][]float64) ([][]float64, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+func (b *Brain) PredictBatch(batchInputs [][]float64) ([][]float64, error) {
 
-	// 1. Flatten the batch [N, 18] into a single [N*18] slice
-	flatInputs := make([]float64, 0, len(radarInputs)*18)
-	for _, input := range radarInputs {
-		flatInputs = append(flatInputs, input...)
+	numRadars := len(batchInputs)
+	if numRadars == 0 {
+		return nil, nil
 	}
 
-	// 2. Load into Gorgonia Tensor
-	batchT := tensor.New(tensor.WithShape(len(radarInputs), 18), tensor.WithBacking(flatInputs))
-	gorgonia.Let(b.x, batchT)
+	// 1. Flatten the 2D slice into a 1D slice for the GPU
+	// Using a pre-allocated flat slice reduces GC pressure during the physics loop.
+	flatInputs := make([]float64, 0, numRadars*18)
+	for _, radar := range batchInputs {
+		flatInputs = append(flatInputs, radar...)
+	}
 
-	// 3. Run parallel execution on GPU
-	if err := b.vm.RunAll(); err != nil {
+	if len(flatInputs) == 0 {
+		return nil, errors.New("empty input flatten result")
+	}
+
+	// 2. PIN THE MEMORY: This tells the Go GC not to move flatInputs
+	var pinIn runtime.Pinner
+	pinIn.Pin(&flatInputs[0])
+	defer pinIn.Unpin()
+
+	// 3. Allocate temporary GPU memory
+	// DeviceMemAlloc is the standard for temporary buffers in this library.
+	d_in, err := cuda.DeviceMemAlloc(uint64(len(flatInputs) * 8))
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate input buffer: %s", err.Error())
+	}
+	defer d_in.Free() // Ensure cleanup even on error
+
+	d_out, err := cuda.DeviceMemAlloc(uint64(numRadars * 3 * 8))
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate output buffer: %v", err)
+	}
+	defer d_out.Free()
+
+	// 4. Sync inputs to the RTX 3060
+	b.SyncDataToGPU(d_in, flatInputs)
+
+	// 5. Configure Thread/Block counts
+	threadsPerBlock := 256
+	blocksPerGrid := (numRadars + threadsPerBlock - 1) / threadsPerBlock
+
+	// 6. Wrap ints into cuda.Dim3 structs
+	gridDim := cuda.Dim3{X: uint32(blocksPerGrid), Y: 1, Z: 1}
+	blockDim := cuda.Dim3{X: uint32(threadsPerBlock), Y: 1, Z: 1}
+
+	// 7. LAUNCH KERNEL with correct types
+	// Device pointers must be local variables
+	inPtr := d_in.Ptr
+	w0Ptr := b.w0_gpu.Ptr
+	w1Ptr := b.w1_gpu.Ptr
+	outPtr := d_out.Ptr
+
+	// CUDA kernel expects 32-bit int
+	nr := int32(numRadars)
+
+	// ---- Launch kernel ----
+	err = b.kernel.Launch(
+		gridDim,
+		blockDim,
+		unsafe.Pointer(&inPtr),
+		unsafe.Pointer(&w0Ptr),
+		unsafe.Pointer(&w1Ptr),
+		unsafe.Pointer(&outPtr),
+		unsafe.Pointer(&nr),
+	)
+
+	if err != nil {
+		return nil, fmt.Errorf("kernel launch failed: %s", err.Error())
+	}
+
+	if err := cuda.CurrentContextSynchronize(); err != nil {
 		return nil, err
 	}
-	defer b.vm.Reset()
 
-	// 4. Transfer result [N, 3] back to Host
-	if machine, ok := b.vm.(gorgonia.CUDAMachine); ok {
-		machine.TransferToHost(b.out)
+	// 8. Download results to Host (CPU)
+	flatOutputs := make([]float64, numRadars*3)
+	// 9. PIN THE MEMORY: This tells the Go GC not to move flatOutputs
+	var pinOut runtime.Pinner
+	pinOut.Pin(&flatOutputs[0])
+	defer pinOut.Unpin()
+
+	b.SyncDataFromGPU(unsafe.Pointer(&flatOutputs[0]), d_out, uint64(numRadars*3))
+
+	// 10. Reshape for the Physics Engine
+	reshaped := make([][]float64, numRadars)
+	for i := 0; i < numRadars; i++ {
+		reshaped[i] = flatOutputs[i*3 : (i+1)*3]
 	}
 
-	// 5. Reshape output back to [N, 3]
-	return reshapeOutput(b.out.Value().Data().([]float64), len(radarInputs)), nil
+	return reshaped, nil
 }
 
 // getBrainInputs generates the 16-variable state representation for the NN.
 // It matches the input structure used in runPhysicsEngine.
 func getBrainInputs(e *Entity, rCount int, snapBudget float64, snapSuccess float64, quadrantRadars []float64, satCount int, dayProgress float64) []float64 {
-
 	// Normalization Helpers
 	normBudget := math.Max(-1, math.Min(snapBudget/1e9, 1.0))
 	normSuccess := snapSuccess / 100.0
 	normDelta := (successRate - lastEraSuccess) / 100.0
-	normDiff := difficultyMultiplier / 10.0 // Was unused
+
+	// NEW: Personal Performance Metric
+	// We look up this specific entity's kills.
+	// Normalized by 10 (assuming a 'good' radar gets 10+ kills per era)
+	personalKills := float64(kills[e.ID])
+	normKills := math.Min(personalKills/10.0, 1.0)
 
 	// Time context (Cyclical)
 	sinTime := math.Sin(2 * math.Pi * dayProgress)
-	cosTime := math.Cos(2 * math.Pi * dayProgress) // Was unused
+	cosTime := math.Cos(2 * math.Pi * dayProgress)
 
 	return []float64{
 		e.Lat / 90.0,                         // 0
@@ -397,118 +546,63 @@ func getBrainInputs(e *Entity, rCount int, snapBudget float64, snapSuccess float
 		math.Min(quadrantRadars[3]/20.0, 1.0), // 13
 
 		normDelta, // 14
-		normDiff,  // 15: Added normDiff to use it
-		sinTime,   // 16: Note - If your Brain shape is (1, 16),
-		cosTime,
+		normKills, // 15
+		sinTime,   // 16
+		cosTime,   // 17
 	}
 }
 
-func loadSystemState() {
-	if data, err := os.ReadFile(RadarFile); err == nil {
-		var savedEntities []Entity
-		if err := json.Unmarshal(data, &savedEntities); err == nil {
-			mu.Lock()
-			// Reset entities to clear any seeded data from main()
-			entities = make(map[string]*Entity)
-
-			for _, e := range savedEntities {
-				newE := &Entity{
-					ID: e.ID, Type: e.Type,
-					Lat: e.Lat, Lon: e.Lon,
-					LaunchLat: e.LaunchLat, LaunchLon: e.LaunchLon,
-					StartTime: e.StartTime, LastMoved: e.LastMoved,
-				}
-
-				// FIX 1: Sync Satellite Orbital Clocks
-				// If we are loading a satellite, we must ensure its StartTime
-				// relative to the current simClock is preserved or reset
-				// to prevent orbital jumping.
-				if e.Type == "SAT" && simClock.IsZero() == false {
-					newE.StartTime = simClock.Unix()
-				}
-
-				entities[e.ID] = newE
-
-				// Re-initialize kills map for radars
-				if e.Type == "RADAR" {
-					kills[e.ID] = 0
-				}
-			}
-			mu.Unlock()
-			log.Printf("Successfully loaded %d entities from persistence.\n", len(savedEntities))
-		}
-	}
-
+func loadSystemState(context *cuda.PrimaryCtx) {
 	f, err := os.Open(BrainFile)
 	if err != nil {
+		log.Printf("No persistence found: %v", err)
 		return
 	}
 	defer f.Close()
 
-	dec := gob.NewDecoder(f)
-	var w0T, w1T *tensor.Dense
-
-	// FIX 2: Correct Input Migration Logic
-	if err := dec.Decode(&w0T); err == nil {
-		currentShape := w0T.Shape()[0]
-		// Migration logic for 12-input architecture
-		if currentShape < 18 {
-			log.Printf("Migrating %d-input brain to 18-input...\n", currentShape)
-			newW0 := tensor.New(tensor.WithShape(12, 18), tensor.WithBacking(make([]float64, 12*18)))
-			oldData := w0T.Data().([]float64)
-			newData := newW0.Data().([]float64)
-
-			// Copy old weights into the new larger tensor
-			copy(newData, oldData)
-
-			// Initialize the new "knowledge" rows (Satellite and Density awareness)
-			// using a small jitter so the AI starts with neutral curiosity.
-			for i := len(oldData); i < 192; i++ {
-				newData[i] = (rand.Float64() - 0.5) * 0.01
-			}
-			gorgonia.Let(brain.w0, newW0)
-		} else {
-			gorgonia.Let(brain.w0, w0T)
-		}
+	// 1. Decode into a temporary "Ghost" brain
+	var loadedBrain Brain
+	decoder := gob.NewDecoder(f)
+	if err := decoder.Decode(&loadedBrain); err != nil {
+		log.Printf("Decode error: %v", err)
+		return
 	}
 
-	if err := dec.Decode(&w1T); err == nil {
-		gorgonia.Let(brain.w1, w1T)
+	// 2. Safely copy only the CPU weights into our active 'brain'
+	// This preserves the brain.w0_gpu and brain.w1_gpu pointers we made in main()
+	mu.Lock()
+	if len(loadedBrain.w0_cpu) > 0 {
+		copy(brain.w0_cpu, loadedBrain.w0_cpu)
+		copy(brain.w1_cpu, loadedBrain.w1_cpu)
 	}
+	mu.Unlock()
 
-	// NEW: After loading weights into nodes, we must signal the CUDA VM
-	// to re-bind these values to the GPU memory.
-	brain.vm.Reset()
-
-	// Ensure we preserve the historical "Tightest Fleet" record
-	dec.Decode(&minEverRadars)
-	dec.Decode(&MaxRadars)
+	// 3. Now it is safe to sync
+	brain.SyncToGPU(context)
+	log.Println("Persistence loaded and synced to GPU.")
 }
 
 func saveSystemState() {
-	mu.RLock() // Protect entities during JSON file preparation
+	mu.RLock()
 	defer mu.RUnlock()
-
-	// NEW: Explicitly pull data from GPU to CPU before saving
-	if machine, ok := brain.vm.(gorgonia.CUDAMachine); ok {
-		machine.TransferToHost(brain.w0)
-		machine.TransferToHost(brain.w1)
-	}
 
 	// 1. Save NN Weights, Min-Ever Record, and Scaled Limit
 	f, err := os.Create(BrainFile)
 	if err == nil {
 		enc := gob.NewEncoder(f)
-		enc.Encode(brain.w0.Value())
-		enc.Encode(brain.w1.Value())
+
+		// CRITICAL CHANGE: Encode the raw float64 slices, not Gorgonia Values.
+		// These slices are the "Source of Truth" for your NN persistence.
+		enc.Encode(brain.w0_cpu)
+		enc.Encode(brain.w1_cpu)
+
 		enc.Encode(minEverRadars)
 		enc.Encode(MaxRadars)
 		f.Close()
 	}
 
-	// 2. Save Optimized Entity Positions
+	// 2. Save Optimized Entity Positions (Remains the same)
 	var optimizedFleet []Entity
-	// REMOVED internal mu.Lock() here because callers must already hold it
 	for _, e := range entities {
 		if e.Type == "CITY" || e.Type == "RADAR" || e.Type == "SAT" {
 			optimizedFleet = append(optimizedFleet, *e)
@@ -521,14 +615,16 @@ func saveSystemState() {
 	}
 }
 
-func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty float64) {
-	// --- 1. MOVE AGGREGATION TO THE TOP ---
+func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty float64, context *cuda.PrimaryCtx, jobs chan<- Job) {
+	// --- 1. Aggregate entities ---
 	radarIDs := []string{}
 	quadrantRadars := make([]float64, 4)
 	satCount := 0
+
 	mu.RLock()
 	for id, e := range entities {
-		if e.Type == "RADAR" {
+		switch e.Type {
+		case "RADAR":
 			radarIDs = append(radarIDs, id)
 			idx := 0
 			if e.Lat < 0 {
@@ -538,59 +634,74 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 				idx += 1
 			}
 			quadrantRadars[idx]++
-		} else if e.Type == "SAT" {
+		case "SAT":
 			satCount++
 		}
 	}
 	mu.RUnlock()
-	rCount := len(radarIDs)
-	dayProgress := 1.0 // End of era
 
-	// --- 2. NOW TRAIN THE BRAIN ---
-	mu.RLock()
+	rCount := len(radarIDs)
+	dayProgress := 1.0
+
+	// --- 2. Train the Brain using Jobs (WITH SYNCHRONIZATION) ---
+	// We use a WaitGroup to ensure all training is finished before resetting the era.
+	var wg sync.WaitGroup
 	for _, id := range radarIDs {
-		e := entities[id]
-		// Now rCount, quadrantRadars, etc. are properly defined and in scope
+		mu.RLock()
+		e, exists := entities[id]
+		k := kills[id]
+		mu.RUnlock()
+
+		if !exists {
+			continue
+		}
+
 		inputs := getBrainInputs(e, rCount, snapBudget, snapSuccess, quadrantRadars, satCount, dayProgress)
 
 		var idealAction []float64
-		if kills[id] > 0 {
-			idealAction = []float64{1.0, 0.0, 0.0} // Stay
+		if k > 0 {
+			idealAction = []float64{1.0, 0.0, 0.0} // Performance was good: stay/reinforce
 		} else {
-			idealAction = []float64{-1.0, 0.0, 0.0} // Move
+			idealAction = []float64{-1.0, 0.0, 0.0} // Performance was bad: relocate
 		}
-		brain.Train(inputs, idealAction)
-	}
-	mu.RUnlock()
 
-	// 1. EVALUATE PERFORMANCE & BONUSES
-	// Reward scaling based on efficiency tiers
+		wg.Add(1)
+		jobs <- Job{
+			Run: func() {
+				defer wg.Done()
+				// Use the updated Train signature (no channel passed in)
+				brain.Train(inputs, idealAction, context)
+			},
+		}
+	}
+
+	// CRITICAL: Block until the GPU worker has processed every single radar.
+	// Without this, the program 'hangs' or wipes stats before training is done.
+	wg.Wait()
+
+	// --- 3. Sync & Save Persistence ---
+	// Now that training is done, sync weights to GPU and save the .gob file
+	brain.mu.Lock()
+	brain.SyncToGPU(context)
+	brain.mu.Unlock()
+	saveSystemState()
+
+	// --- 4. Evaluate performance & bonuses ---
 	if successRate >= 100.0 {
-		difficultyMultiplier += 0.1 // Threats get 10% faster every era the AI wins
-		EfficiencyBonus = EfficiencyBonus * 1.1
-	} else if successRate >= 99.0 {
-		difficultyMultiplier += 0.05 // Threats get 5% faster every era the AI wins
-		EfficiencyBonus = EfficiencyBonus * 1.05
+		difficultyMultiplier += 0.1
+		EfficiencyBonus *= 1.1
 	} else if successRate >= 99.5 {
-		EfficiencyBonus = EfficiencyBonus * 1.025
+		difficultyMultiplier += 0.05
+		EfficiencyBonus *= 1.05
+	} else if successRate >= 99.0 {
+		EfficiencyBonus *= 1.025
 	} else {
-		EfficiencyBonus = 100000.0 // Reset to baseline on failure
+		EfficiencyBonus = 100000.0
 	}
 
-	// 3. TARGET SCALING (Fleet Tightening)
-	if successRate >= 99.5 && (totalThreats+totalIntercepts) >= 50 {
-		if rCount < minEverRadars {
-			minEverRadars = rCount
-			MaxRadars = minEverRadars
-			log.Printf("\nNEW RECORD: Max fleet size tightened to %d units.\n", MaxRadars)
-			saveSystemState()
-		}
-	}
-
-	// 4. AGGRESSIVE PRUNING WITH NEWBORN PROTECTION
+	// --- 5. Fleet pruning ---
 	if successRate >= 95.0 {
 		mu.RLock()
-		// Sort by kills (Ascending)
 		sort.Slice(radarIDs, func(i, j int) bool {
 			return kills[radarIDs[i]] < kills[radarIDs[j]]
 		})
@@ -598,70 +709,60 @@ func autonomousEraReset(snapBudget float64, snapSuccess float64, snapDifficulty 
 
 		numToDrop := int(float64(rCount) * 0.15)
 		dropped := 0
-		now := simClock.Unix() // Use the simulation clock for timing
-
-		// 6-hour protection window in simulation time
+		now := simClock.Unix()
 		gracePeriodSeconds := int64(6 * time.Hour.Seconds())
 
 		for _, id := range radarIDs {
-			// Stop if we've dropped enough or hit the floor
 			if dropped >= numToDrop || (len(radarIDs)-dropped) <= MinRadars {
 				break
 			}
+
 			mu.RLock()
 			e, exists := entities[id]
-			if !exists {
-				continue
-			}
 			mu.RUnlock()
-
-			// --- THE FIX: NEWBORN GRACE PERIOD ---
-			// If the radar is younger than 6 hours, skip it.
-			// It hasn't had enough "exposure time" to prove its worth.
-			if (now - e.StartTime) < gracePeriodSeconds {
+			if !exists || (now-e.StartTime) < gracePeriodSeconds {
 				continue
 			}
 
 			mu.Lock()
-			// If it's old enough and still has 0 or low kills, prune it
 			delete(entities, id)
 			delete(kills, id)
 			mu.Unlock()
 			dropped++
 
-			// Refund/Efficiency Reward logic
 			scalingFactor := 1.0 + (100.0 / float64(len(entities)-len(cityNames)+1))
 			budget += EfficiencyBonus * scalingFactor
 		}
-		saveSystemState()
 	}
 
-	// 5. CRISIS RECOVERY
+	// --- 6. Crisis recovery ---
 	if budget < BankruptcyLimit || (rCount < MinRadars && budget < RadarCost) {
 		log.Println("CRISIS: Adaptive Mutation Triggered...")
-		brain.AdaptiveMutate(successRate)
-		budget = EmergencyBudget // Emergency Capital Injection
+		brain.mu.Lock()
+		brain.AdaptiveMutate(successRate, context)
+		brain.mu.Unlock()
+		budget = EmergencyBudget
 	}
 
 	lastEraSuccess = successRate
 
+	// --- 7. Finalize era & Reset Stats ---
 	mu.Lock()
-	// 6. FINALIZE ERA & CLOCK SNAP
 	for id := range kills {
-		kills[id] = 0
+		kills[id] = 0 // Safe to clear now: training is 100% complete
 	}
-	mu.Unlock()
 	currentCycle++
 
-	// FIX: Explicitly snap eraStartTime to prevent simClock drift
 	eraStartTime = eraStartTime.Add(EraDuration)
 	simClock = eraStartTime
-
 	wallStart = time.Now()
 	totalThreats, totalIntercepts = 0, 0
 	for i := range quadrantMisses {
 		quadrantMisses[i] = 0
 	}
+	mu.Unlock()
+
+	log.Printf("--- ERA %d STARTED | PERSISTENCE MAINTAINED ---", currentCycle)
 }
 
 // getSatellitePos calculates the current Lat/Lon based on launch origin and orbital mechanics.
@@ -822,7 +923,30 @@ func getTargetedTether(quadrant int) (float64, float64) {
 	return lat, lon
 }
 
-func runPhysicsEngine(ctx context.Context) {
+func gpuWorker(ctx *cuda.PrimaryCtx, jobs <-chan Job, ready chan<- struct{}) {
+	// Lock this OS thread for the lifetime of the worker
+	runtime.LockOSThread()
+
+	// Set CUDA context
+	if err := cuda.SetCurrentContext(&ctx.Context); err != nil {
+		panic(err)
+	}
+
+	// Signal that GPU is ready
+	if ready != nil {
+		close(ready)
+	}
+
+	// Process jobs indefinitely until channel is closed
+	for job := range jobs {
+		job.Run()
+	}
+
+	// Worker exits; OS thread can be unlocked automatically
+	// (optional in Go; usually left locked until process exit)
+}
+
+func runPhysicsEngine(ctx context.Context, cuda_ctx *cuda.PrimaryCtx, jobs chan<- Job) {
 	var lastLaunch time.Time
 	mu.Lock()
 	if simClock.IsZero() {
@@ -840,7 +964,7 @@ func runPhysicsEngine(ctx context.Context) {
 		default:
 			if simClock.After(eraStartTime.Add(EraDuration)) || forceReset {
 				forceReset = false
-				autonomousEraReset(budget, successRate, difficultyMultiplier)
+				autonomousEraReset(budget, successRate, difficultyMultiplier, cuda_ctx, jobs)
 				continue
 			}
 
@@ -892,7 +1016,6 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-
 					return
 				default:
 					snap[id] = EntityVal{ID: e.ID, Type: e.Type, Lat: e.Lat, Lon: e.Lon}
@@ -931,7 +1054,6 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-
 					return
 				default:
 					wg.Add(1)
@@ -1012,7 +1134,6 @@ func runPhysicsEngine(ctx context.Context) {
 						}{li, lt, lr, lp, lMisses}
 					}()
 				}
-
 			}
 
 			go func() { wg.Wait(); close(workerKills); close(workerStats) }()
@@ -1021,7 +1142,6 @@ func runPhysicsEngine(ctx context.Context) {
 				select {
 				case <-ctx.Done():
 					// This case triggers the moment cancel() is called elsewhere
-
 					return
 				default:
 					mu.Lock()
@@ -1050,25 +1170,13 @@ func runPhysicsEngine(ctx context.Context) {
 				}
 			}
 
-			simClock = simClock.Add(TimeStepping)
-
-			// Adjust learning rate: The better we do, the less we "mutate"
-			currentLR := 0.01
 			if successRate < 99.0 {
-				currentLR = 0.01
+				mutationRate = 0.01
+			} else if successRate >= 99.0 && successRate < 99.9 {
+				mutationRate = 0.001 // Reduce for stability
+			} else if successRate >= 99.9 {
+				mutationRate = 0.0001 // Lock in the "optimized" state
 			}
-			if successRate >= 99.0 {
-				currentLR = 0.001 // Reduce by 10x for stability
-			}
-			if successRate >= 99.9 {
-				currentLR = 0.0001 // Lock in the "best placement"
-			}
-
-			// Apply the new rate to the solver
-			brain.solver = gorgonia.NewVanillaSolver(
-				gorgonia.WithLearnRate(currentLR),
-				gorgonia.WithClip(5.0),
-			)
 
 			// 2. WIN STREAK & CONVERGENCE
 			// Ensure a minimum threat volume before counting a 'Win' to prevent cheesing
@@ -1103,150 +1211,81 @@ func runPhysicsEngine(ctx context.Context) {
 				successRate = (float64(totalIntercepts) / float64(totalThreats+totalIntercepts)) * 100
 			}
 
-			// NN Prediction & Actions
-			dayProgress := simClock.Sub(eraStartTime).Seconds() / EraDuration.Seconds()
-
-			// BATCHING TO CUDA
-			mu.RLock()
-			for _, e := range entities {
-				if e.Type == "RADAR" {
-					activeRadars = append(activeRadars, e)
-					// input := getBrainInputs(...) logic here
-					batchInputs = append(batchInputs, getBrainInputs(e, rCount, budget, successRate, quadrantRadars, satCount, dayProgress))
-				}
-			}
-			mu.RUnlock()
-
-			// 2. RUN GPU INFERENCE (All cores used)
 			if len(batchInputs) > 0 {
-				results, err := brain.PredictBatch(batchInputs)
-				if err == nil {
-					for i, res := range results {
-						// Check for context cancellation during processing
-						select {
-						case <-ctx.Done():
-							return
-						default:
-							e := activeRadars[i]
+				// Capture slices locally to avoid closure issues
+				inputs := append([][]float64(nil), batchInputs...)
+				radars := append([]*Entity(nil), activeRadars...)
 
-							// Extract raw NN outputs
-							actionValue := res[0]
-							latN, lonN := res[1], res[2]
+				job := Job{
+					Run: func() {
+						results := make([][]float64, len(inputs))
+						for i, input := range inputs {
+							// Evaluate on GPU
+							results[i] = brain.Evaluate(input)
+						}
 
-							// Determine Discrete Action
+						// Apply results
+						for i, res := range results {
+							e := radars[i]
+
 							action := 0
-							if actionValue > 0.1 {
+							if res[0] > 0.1 {
 								action = 1 // BUILD
-							} else if actionValue < -0.1 {
+							} else if res[0] < -0.1 {
 								action = 2 // RELOCATE
 							}
 
-							// 3. APPLY YOUR CUSTOM LOGIC (Kickstart, Targeted Leap, Budgeting)
-							processAdvancedAction(ctx, e, action, latN, lonN, successRate, rCount, quadrantRadars, satCount, dayProgress)
+							latN, lonN := res[1], res[2]
+							prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
+
+							// Determine quadrant needing help
+							targetQ := 0
+							maxM := -1.0
+							for qi, m := range quadrantMisses {
+								if m > maxM {
+									maxM = m
+									targetQ = qi
+								}
+							}
+
+							if action == 1 && rCount < MaxRadars && budget >= RadarCost {
+								bLat, bLon := getTargetedTether(targetQ)
+								id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
+
+								entities[id] = &Entity{
+									ID:        id,
+									Type:      "RADAR",
+									Lat:       bLat + (latN * prec / 111.0),
+									Lon:       bLon + (lonN * prec / 111.0),
+									StartTime: simClock.Unix(),
+								}
+								kills[id] = 0
+								budget -= RadarCost
+								rCount++
+
+							} else if action == 2 && budget >= RelocationCost {
+								bLat, bLon := getTargetedTether(targetQ)
+								e.Lat = bLat + (latN * 50.0 / 111.0)
+								e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
+								e.LastMoved = time.Now().UnixMilli()
+								kills[e.ID] = 0
+								budget -= RelocationCost
+							}
 						}
-						runtime.Gosched()
-					}
+					},
 				}
-			}
-		}
-	}
-}
 
-func processAdvancedAction(ctx context.Context, e *Entity, action int, latN float64, lonN float64, successRate float64, rCount int, quadrantRadars []float64, satCount int, dayProgress float64) {
-	select {
-	case <-ctx.Done():
-		// This case triggers the moment cancel() is called elsewhere
-		return
-	default:
-		// --- KICKSTART LOGIC ---CHEAT
-		// If we haven't moved in 100 eras and success is low, force an action
-		//if successRate <= 50.0 && rand.Float64() < 0.05 {
-		//	if rCount < MaxRadars {
-		//		action = 1 // Force Build
-		//	} else {
-		//		action = 2 // Force Relocate
-		//	}
-		//}
-
-		prec := math.Max(5.0, 20.0*(1.0-(successRate/100.0)))
-
-		canAffordBuild := (rCount < MaxRadars) && (budget >= RadarCost)
-		canAffordMove := budget >= RelocationCost
-
-		if action == 1 && canAffordBuild {
-			tQ := 0
-			maxM := -1.0
-			for i, m := range quadrantMisses {
-				if m > maxM {
-					maxM = m
-					tQ = i
-				}
+				// Send to GPU worker
+				gpuJobs <- job
 			}
 			mu.Lock()
-			bLat, bLon := getTargetedTether(tQ)
-			id := fmt.Sprintf("R-AI-%d-%d", currentCycle, rand.Intn(1e7))
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: bLat + (latN * prec), Lon: bLon + (lonN * prec), StartTime: simClock.Unix()}
-			kills[id] = 0
-			if budget >= RadarCost {
-				budget -= RadarCost
-			}
-			rCount = rCount + 1
+			simClock = simClock.Add(TimeStepping)
 			mu.Unlock()
-		} else if action == 2 && canAffordMove {
-			var worstID string
-			minK := 999999
 
-			mu.RLock()
-			// 1. Identify the most "Useless" Radar
-			for id, c := range kills {
-				if e, ok := entities[id]; ok && e.Type == "RADAR" && c < minK {
-					minK = c
-					worstID = id
-				}
-			}
-			mu.RUnlock()
-			mu.RLock()
-			if e, ok := entities[worstID]; ok {
-				mu.RUnlock()
-				// 2. Identify the Crisis Zone (Quadrant with the MOST misses)
-				targetQ := 0
-				maxMiss := -1.0
-				for i, m := range quadrantMisses {
-					if m > maxMiss {
-						maxMiss = m
-						targetQ = i
-					}
-				}
-
-				mu.Lock()
-				// 3. TARGETED LEAP: Get a base position in that specific quadrant
-				// Instead of e.Lat = e.Lat + nudge, we do:
-				bLat, bLon := getTargetedTether(targetQ)
-				mu.Unlock()
-
-				// 4. APPLY POSITION: Leap to the city, then use NN nudge for local offset
-				// precision here should be around 50-100km to spread them out around the city
-				e.Lat = bLat + (latN * 50.0 / 111.0) // 111km per degree approx
-				e.Lon = bLon + (lonN * 50.0 / (111.0 * math.Cos(bLat*math.Pi/180.0)))
-
-				e.LastMoved = time.Now().UnixMilli() // Visual feedback for UI
-
-				kills[worstID] = 0 // Reset performance for the new era
-
-				e.LastMoved = time.Now().UnixMilli()
-
-				if budget >= RelocationCost {
-					budget -= RelocationCost
-				}
-				//fmt.Printf("STRATEGY: Leaping radar %s to Quadrant %d (City Tether)\n", worstID, targetQ)
-			} else {
-				mu.RUnlock()
-			}
+			runtime.Gosched() // CRITICAL: Gives the web server/UI a window to get the lock
+			//time.Sleep(10 * time.Millisecond) // Prevents 100% CPU lock
 		}
 	}
-	mu.Lock()
-	simClock = simClock.Add(TimeStepping)
-	mu.Unlock()
 }
 
 func getCityData() map[string][]float64 {
@@ -1444,51 +1483,135 @@ func getCityData() map[string][]float64 {
 	return cityData
 }
 
+func initialisation() *cuda.InitToken {
+	dev, err := cuda.Init(0) // 0 is the device number
+	if err != nil {
+		panic(err) // or handle the error
+	}
+	return dev // close the library when done. REQUIRED, see below
+}
+
 func main() {
+
+	// -------------------------------------------------
+	// 1. INITIALIZE CUDA DEVICE + CONTEXT
+	// -------------------------------------------------
+	dev := initialisation()
+	defer dev.Close()
+
+	// -------------------------------------------------
+	// 2. INITIALIZE NEURAL NETWORK (GPU READY)
+	// MUST happen AFTER CUDA init
+	// -------------------------------------------------
+	brain = NewCudaBrain()
+
+	// -------------------------------------------------
+	// 3. CREATE GPU JOB QUEUE + WORKER
+	// Worker owns CUDA context + locked OS thread
+	// -------------------------------------------------
+	gpuJobs = make(chan Job, 64)
+
+	ready := make(chan struct{})
+	go gpuWorker(dev.PrimaryCtx, gpuJobs, ready)
+	<-ready
+
+	// -------------------------------------------------
+	// 4. SYSTEM RUNTIME CONFIG
+	// -------------------------------------------------
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// 1. POPULATE CITIES
+	// -------------------------------------------------
+	// 5. POPULATE CITY DATABASE
+	// -------------------------------------------------
 	cityData := getCityData()
 
 	for name, pos := range cityData {
-		entities[name] = &Entity{ID: name, Type: "CITY", Lat: pos[0], Lon: pos[1]}
+		entities[name] = &Entity{
+			ID:   name,
+			Type: "CITY",
+			Lat:  pos[0],
+			Lon:  pos[1],
+		}
 		cityNames = append(cityNames, name)
 	}
 
 	log.Printf("Protecting %d cities\n", len(cityData))
 
-	// 2. INITIALIZE NEURAL NETWORK
-	// Use a small multiplier for initial weight scaling to prevent saturation
-	brain = NewBrain()
+	// -------------------------------------------------
+	// 6. LOAD PERSISTENCE
+	// (May overwrite brain weights)
+	// -------------------------------------------------
+	loadSystemState(dev.PrimaryCtx)
 
-	// 3. LOAD PERSISTENCE (Crucial for NN Persistence)
-	// We call this before seeding so we know if we actually need a new fleet
-	loadSystemState()
-
-	// 4. SEED FLEET (Only if no optimized fleet was loaded)
+	// -------------------------------------------------
+	// 7. SEED RADAR FLEET IF NEEDED
+	// -------------------------------------------------
 	radarCount := 0
 	for _, e := range entities {
 		if e.Type == "RADAR" {
 			radarCount++
 		}
 	}
+
 	if radarCount < MinRadars {
+
 		log.Println("NO PERSISTENCE FOUND. INITIALIZING SEED FLEET...")
+
 		for i := 0; i < MinRadars; i++ {
+
 			id := fmt.Sprintf("R-START-%d", i)
 			lat, lon := getTetheredCoords()
-			entities[id] = &Entity{ID: id, Type: "RADAR", Lat: lat, Lon: lon, StartTime: time.Now().Unix()}
+
+			entities[id] = &Entity{
+				ID:        id,
+				Type:      "RADAR",
+				Lat:       lat,
+				Lon:       lon,
+				StartTime: time.Now().Unix(),
+			}
 		}
+
 	} else {
 		log.Printf("RESUMING ERA %d WITH %d OPTIMIZED ASSETS\n", currentCycle, radarCount)
 	}
 
+	// -------------------------------------------------
+	// 8. START SIMULATION CLOCK
+	// -------------------------------------------------
 	wallStart = time.Now()
-	go runPhysicsEngine(ctx)
+
+	// -------------------------------------------------
+	// 9. START PHYSICS ENGINE
+	// -------------------------------------------------
+	go runPhysicsEngine(ctx, dev.PrimaryCtx, gpuJobs)
+
+	// -------------------------------------------------
+	// 10. START MANUAL / WEB CONTROL SERVER
+	// -------------------------------------------------
+	go startManualServer(dev.PrimaryCtx)
 
 	log.Println("AEGIS RUNNING AT :8080")
-	startManualServer()
+
+	// -------------------------------------------------
+	// 11. GRACEFUL SHUTDOWN HANDLER
+	// -------------------------------------------------
+	sigChan := make(chan os.Signal, 1)
+
+	signal.Notify(sigChan,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+	)
+
+	<-sigChan
+
+	log.Println("Shutdown signal received")
+
+	cancel()          // stop physics engine
+	close(gpuJobs)    // stop GPU worker
+	saveSystemState() // persist fleet + brain
+
+	log.Println("Shutdown complete")
 }
 
 func sendHTTPResponse(conn net.Conn, contentType string, data []byte) {
@@ -1503,7 +1626,7 @@ func sendHTTPResponse(conn net.Conn, contentType string, data []byte) {
 	conn.Write(data)
 }
 
-func startManualServer() {
+func startManualServer(context *cuda.PrimaryCtx) {
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		return
@@ -1515,11 +1638,11 @@ func startManualServer() {
 			continue
 		}
 		// Handle each connection in a way that respects your Mutex
-		go handleConnection(conn)
+		go handleConnection(conn, context)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, ctx *cuda.PrimaryCtx) {
 	defer conn.Close()
 
 	buf := make([]byte, 1024)
@@ -1533,7 +1656,7 @@ func handleConnection(conn net.Conn) {
 		// Prepare Intel Data
 		serveIntel(conn)
 	} else if bytes.Contains(buf[:n], []byte("GET /panic")) {
-		servePanic(conn)
+		servePanic(conn, ctx)
 		sendHTTPResponse(conn, "text/html", []byte(uiHTML))
 	} else if bytes.Contains(buf[:n], []byte("GET /save")) {
 		saveSystemState()
@@ -1543,7 +1666,7 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func servePanic(conn net.Conn) {
+func servePanic(conn net.Conn, context *cuda.PrimaryCtx) {
 	cancel()
 	time.Sleep(10 * time.Millisecond) // to let the cancel signal time to reach the goroutines.
 	if mu.TryLock() {
@@ -1591,7 +1714,7 @@ func servePanic(conn net.Conn) {
 			mu.Unlock()
 		}
 	}
-	go runPhysicsEngine(ctx)
+	go runPhysicsEngine(ctx, context, gpuJobs)
 }
 
 func serveIntel(conn net.Conn) {
@@ -1633,20 +1756,20 @@ const uiHTML = `
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-    body { margin:0; background:#000810; color:#0f0; font-family:'Segoe UI', 'Courier New', monospace; overflow:hidden; }
-    #stats {
-        position:fixed; top:15px; left:15px; z-index:1000;
-        background:rgba(0,10,20,0.9); padding:20px; border:1px solid #0af;
+    body { margin:0; background:#000810; color:#0f0; font-family:'Segoe UI', 'Courier New', monospace; overflow:hidden; } 
+    #stats { 
+        position:fixed; top:15px; left:15px; z-index:1000; 
+        background:rgba(0,10,20,0.9); padding:20px; border:1px solid #0af; 
         box-shadow: 0 0 15px rgba(0,170,255,0.3); border-radius: 8px; width: 320px;
         backdrop-filter: blur(5px);
-    }
+    } 
     #map { height:100vh; width:100vw; background: #000; }
     .stat-line { font-size: 0.95em; margin-bottom: 8px; display: flex; justify-content: space-between; border-bottom: 1px solid #0af2; padding-bottom: 4px; }
     .val { color: #fff; font-weight: bold; }
-
+    
     /* Confidence & Intelligence Dashboard */
-    .intel-box {
-        margin-top: 15px; padding: 12px; border: 1px solid #fb0;
+    .intel-box { 
+        margin-top: 15px; padding: 12px; border: 1px solid #fb0; 
         background: rgba(251, 176, 0, 0.1); text-align: center; border-radius: 4px;
     }
     #confidence-bar { height: 6px; background: #111; margin-top: 10px; border-radius: 3px; border: 1px solid #0af3; overflow: hidden; }
@@ -1674,7 +1797,7 @@ const uiHTML = `
     <div class="stat-line">EFFICIENCY <span id="success" class="val">0.00</span>%</div>
     <div class="stat-line">THROUGHPUT <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET <span id="budget" class="val" style="color:#fb0">$0</span></div>
-
+    
     <div class="intel-box">
         <span style="font-size:0.7em; color:#aaa; font-weight: bold;">AI COGNITION LEVEL</span>
         <span id="ai-level">CALIBRATING...</span>
@@ -1692,7 +1815,7 @@ const uiHTML = `
 <script>
     var map = L.map('map', { zoomControl:false, attributionControl:false, preferCanvas: true }).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-
+    
     var layers = {};
     var isFetching = false;
 
@@ -1709,8 +1832,8 @@ const uiHTML = `
     async function saveRadarFile() {
         const btn = document.getElementById('save-btn');
         btn.innerText = "WRITING TO DISK...";
-        try {
-            const resp = await fetch('/save');
+        try { 
+            const resp = await fetch('/save'); 
             if(resp.ok) {
                 btn.innerText = "RADAR.JSON SECURED";
                 btn.style.color = "#0f0";
@@ -1753,7 +1876,7 @@ const uiHTML = `
             fill.style.background = ai.color;
 
             // 3. Map Rendering (Restored Pulse & Cleanup)
-            const now = data.server_time || Date.now();
+            const now = data.server_time || Date.now(); 
             const currentIds = new Set();
             let radarCount = 0;
 
@@ -1788,6 +1911,6 @@ const uiHTML = `
         } catch (e) { console.error("UI Data Sync Failure:", e); }
         isFetching = false;
     }
-
+    
     setInterval(updateUI, 43); // 23 FPS Sync
 </script></body></html>`
