@@ -15,10 +15,7 @@ import (
 	"sort"
 	"sync"
 	"time"
-
-	"gorgonia.org/gorgonia"
-	"gorgonia.org/gorgonia/cuda"
-	"gorgonia.org/tensor"
+	"github.com/InternatBlackhole/cudago/cuda"
 )
 
 const (
@@ -1636,20 +1633,20 @@ const uiHTML = `
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-    body { margin:0; background:#000810; color:#0f0; font-family:'Segoe UI', 'Courier New', monospace; overflow:hidden; } 
-    #stats { 
-        position:fixed; top:15px; left:15px; z-index:1000; 
-        background:rgba(0,10,20,0.9); padding:20px; border:1px solid #0af; 
+    body { margin:0; background:#000810; color:#0f0; font-family:'Segoe UI', 'Courier New', monospace; overflow:hidden; }
+    #stats {
+        position:fixed; top:15px; left:15px; z-index:1000;
+        background:rgba(0,10,20,0.9); padding:20px; border:1px solid #0af;
         box-shadow: 0 0 15px rgba(0,170,255,0.3); border-radius: 8px; width: 320px;
         backdrop-filter: blur(5px);
-    } 
+    }
     #map { height:100vh; width:100vw; background: #000; }
     .stat-line { font-size: 0.95em; margin-bottom: 8px; display: flex; justify-content: space-between; border-bottom: 1px solid #0af2; padding-bottom: 4px; }
     .val { color: #fff; font-weight: bold; }
-    
+
     /* Confidence & Intelligence Dashboard */
-    .intel-box { 
-        margin-top: 15px; padding: 12px; border: 1px solid #fb0; 
+    .intel-box {
+        margin-top: 15px; padding: 12px; border: 1px solid #fb0;
         background: rgba(251, 176, 0, 0.1); text-align: center; border-radius: 4px;
     }
     #confidence-bar { height: 6px; background: #111; margin-top: 10px; border-radius: 3px; border: 1px solid #0af3; overflow: hidden; }
@@ -1677,7 +1674,7 @@ const uiHTML = `
     <div class="stat-line">EFFICIENCY <span id="success" class="val">0.00</span>%</div>
     <div class="stat-line">THROUGHPUT <span id="yps" class="val">0</span> Y/sec</div>
     <div class="stat-line">BUDGET <span id="budget" class="val" style="color:#fb0">$0</span></div>
-    
+
     <div class="intel-box">
         <span style="font-size:0.7em; color:#aaa; font-weight: bold;">AI COGNITION LEVEL</span>
         <span id="ai-level">CALIBRATING...</span>
@@ -1695,7 +1692,7 @@ const uiHTML = `
 <script>
     var map = L.map('map', { zoomControl:false, attributionControl:false, preferCanvas: true }).setView([20, 0], 2);
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-    
+
     var layers = {};
     var isFetching = false;
 
@@ -1712,8 +1709,8 @@ const uiHTML = `
     async function saveRadarFile() {
         const btn = document.getElementById('save-btn');
         btn.innerText = "WRITING TO DISK...";
-        try { 
-            const resp = await fetch('/save'); 
+        try {
+            const resp = await fetch('/save');
             if(resp.ok) {
                 btn.innerText = "RADAR.JSON SECURED";
                 btn.style.color = "#0f0";
@@ -1756,7 +1753,7 @@ const uiHTML = `
             fill.style.background = ai.color;
 
             // 3. Map Rendering (Restored Pulse & Cleanup)
-            const now = data.server_time || Date.now(); 
+            const now = data.server_time || Date.now();
             const currentIds = new Set();
             let radarCount = 0;
 
@@ -1791,6 +1788,6 @@ const uiHTML = `
         } catch (e) { console.error("UI Data Sync Failure:", e); }
         isFetching = false;
     }
-    
+
     setInterval(updateUI, 43); // 23 FPS Sync
 </script></body></html>`
